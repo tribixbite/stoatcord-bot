@@ -49,6 +49,17 @@ export class Store {
     return row?.stoat_server_id ?? null;
   }
 
+  /** Check if a Stoat server ID is linked to any Discord guild */
+  getGuildForStoatServer(stoatServerId: string): ServerLinkRow | null {
+    return (
+      this.db
+        .query<ServerLinkRow, [string]>(
+          "SELECT * FROM server_links WHERE stoat_server_id = ?"
+        )
+        .get(stoatServerId) ?? null
+    );
+  }
+
   // --- Channel Links ---
 
   linkChannel(

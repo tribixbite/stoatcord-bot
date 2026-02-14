@@ -81,6 +81,12 @@ export function registerDiscordEvents(
 
 // --- Command handlers ---
 
+/**
+ * /migrate command handler.
+ * Security: Discord enforces Administrator permission via setDefaultMemberPermissions.
+ * Additional checks in wizard.ts: bot ownership of target Stoat server,
+ * one-to-one guild↔server binding (prevents cross-guild hijacking).
+ */
 async function handleMigrate(
   interaction: ChatInputCommandInteraction,
   store: Store,
@@ -97,8 +103,10 @@ async function handleMigrate(
 
   const stoatServerId =
     interaction.options.getString("stoat_server_id") ?? undefined;
+  const mode =
+    (interaction.options.getString("mode") as "missing" | "roles" | "categories" | "all" | null) ?? "missing";
 
-  await startMigrationWizard(interaction, guild, store, stoatClient, stoatServerId);
+  await startMigrationWizard(interaction, guild, store, stoatClient, stoatServerId, mode);
 }
 
 async function handleLink(

@@ -11,88 +11,290 @@ import {
 } from "discord.js";
 import type { Store } from "../db/store.ts";
 import type { StoatClient } from "../stoat/client.ts";
+import type { Server as StoatServer, Channel as StoatChannel } from "../stoat/types.ts";
 import { mapDiscordChannels, groupByCategory } from "./channels.ts";
 import { mapDiscordRoles } from "./roles.ts";
 import { executeMigration, type MigrationProgress } from "./progress.ts";
 
+export type MigrateMode = "missing" | "roles" | "categories" | "all";
+
 /**
  * Start the interactive migration wizard.
- * Shows a preview of Discord channels/roles, lets user confirm, then executes.
+ * Fetches existing Stoat server state to diff and avoid duplicates.
  */
 export async function startMigrationWizard(
   interaction: ChatInputCommandInteraction,
   guild: Guild,
   store: Store,
   stoatClient: StoatClient,
-  existingStoatServerId?: string
+  existingStoatServerId?: string,
+  mode: MigrateMode = "missing"
 ): Promise<void> {
   await interaction.deferReply();
 
-  // Fetch full guild data
+  // --- Security checks ---
+
+  // 1. If a Stoat server ID is provided, verify the bot can actually access it
+  //    (the bot's token must have permission — it owns servers it created)
+  if (existingStoatServerId) {
+    try {
+      const server = await stoatClient.getServer(existingStoatServerId);
+      // Verify the bot owns this server (bot's user is the server owner)
+      const self = await stoatClient.getSelf();
+      if (server.owner !== self._id) {
+        await interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setTitle("Permission Denied")
+              .setDescription(
+                `The bot does not own Stoat server \`${existingStoatServerId}\`. ` +
+                `Only servers created by this bot can be targeted for migration.`
+              )
+              .setColor(0xff0000),
+          ],
+        });
+        return;
+      }
+    } catch {
+      // getServer will fail if bot can't access — handled in the fetch block below
+    }
+
+    // 2. Check if this Stoat server is already linked to a DIFFERENT Discord guild
+    const existingLink = store.getGuildForStoatServer(existingStoatServerId);
+    if (existingLink && existingLink.discord_guild_id !== guild.id) {
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("Server Already Linked")
+            .setDescription(
+              `Stoat server \`${existingStoatServerId}\` is already linked to ` +
+              `Discord guild \`${existingLink.discord_guild_id}\`. ` +
+              `Each Stoat server can only be linked to one Discord guild.`
+            )
+            .setColor(0xff0000),
+        ],
+      });
+      return;
+    }
+  }
+
+  // Fetch full guild data from Discord
   await guild.channels.fetch();
   await guild.roles.fetch();
 
-  // Map channels and roles
-  const channelMappings = mapDiscordChannels(guild);
-  const roleMappings = mapDiscordRoles(guild);
-  const categoryGroups = groupByCategory(channelMappings);
+  // Map all Discord channels and roles
+  const allChannels = mapDiscordChannels(guild);
+  const allRoles = mapDiscordRoles(guild);
+
+  // If migrating into existing server, fetch its state for diffing
+  let existingServer: StoatServer | null = null;
+  let existingChannelNames = new Set<string>();
+  let existingRoleNames = new Set<string>();
+
+  if (existingStoatServerId) {
+    try {
+      existingServer = await stoatClient.getServer(existingStoatServerId);
+
+      // Fetch channel names for comparison
+      for (const chId of existingServer.channels) {
+        try {
+          const ch = await stoatClient.getChannel(chId);
+          if (ch.name) existingChannelNames.add(ch.name.toLowerCase());
+        } catch {
+          // Channel may have been deleted
+        }
+      }
+
+      // Collect existing role names
+      if (existingServer.roles) {
+        for (const role of Object.values(existingServer.roles)) {
+          existingRoleNames.add(role.name.toLowerCase());
+        }
+      }
+
+      console.log(
+        `[migrate] Existing server has ${existingChannelNames.size} channels, ${existingRoleNames.size} roles`
+      );
+    } catch (err) {
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("Migration Error")
+            .setDescription(
+              `Could not fetch Stoat server \`${existingStoatServerId}\`: ${err}`
+            )
+            .setColor(0xff0000),
+        ],
+      });
+      return;
+    }
+  }
+
+  // Apply mode filter — mark items as selected/deselected based on mode and existing state
+  for (const ch of allChannels) {
+    const alreadyExists = existingChannelNames.has(ch.stoatName.toLowerCase());
+
+    switch (mode) {
+      case "missing":
+        // Only create channels that don't already exist
+        ch.selected = !alreadyExists;
+        break;
+      case "roles":
+        // Don't create any channels in roles-only mode
+        ch.selected = false;
+        break;
+      case "categories":
+        // Don't create channels, just organize existing ones
+        ch.selected = false;
+        break;
+      case "all":
+        // Create everything (user was warned about duplicates)
+        ch.selected = true;
+        break;
+    }
+  }
+
+  for (const role of allRoles) {
+    const alreadyExists = existingRoleNames.has(role.stoatName.toLowerCase());
+
+    switch (mode) {
+      case "missing":
+        role.selected = !alreadyExists;
+        break;
+      case "roles":
+        // Create roles that don't exist yet
+        role.selected = !alreadyExists;
+        break;
+      case "categories":
+        role.selected = false;
+        break;
+      case "all":
+        role.selected = true;
+        break;
+    }
+  }
+
+  const selectedChannels = allChannels.filter((c) => c.selected);
+  const selectedRoles = allRoles.filter((r) => r.selected);
+  const skippedChannels = allChannels.filter((c) => !c.selected);
+  const skippedRoles = allRoles.filter((r) => !r.selected);
 
   // Build preview embed
+  const modeLabel: Record<MigrateMode, string> = {
+    missing: "Missing only (skip existing)",
+    roles: "Roles only",
+    categories: "Categories only",
+    all: "Everything (may duplicate!)",
+  };
+
   const previewEmbed = new EmbedBuilder()
     .setTitle(`Migration Preview: ${guild.name}`)
     .setColor(0x4f8a5e)
     .setDescription(
-      existingStoatServerId
-        ? `Migrating into existing Stoat server \`${existingStoatServerId}\``
-        : "A new Stoat server will be created"
+      `**Mode**: ${modeLabel[mode]}\n` +
+        (existingStoatServerId
+          ? `**Target**: Existing Stoat server \`${existingStoatServerId}\``
+          : "**Target**: New Stoat server (will be created)")
     );
 
-  // Channel list grouped by category
-  let channelList = "";
-  for (const [category, channels] of categoryGroups) {
-    channelList += `**${category ?? "No Category"}**\n`;
-    for (const ch of channels) {
-      const icon = ch.stoatType === "Voice" ? "🔊" : "#";
-      channelList += `  ${icon} ${ch.stoatName}\n`;
+  // Show what will be created
+  if (mode === "categories") {
+    // Categories-only mode: show category organization plan
+    const categoryGroups = groupByCategory(allChannels);
+    let catPlan = "";
+    for (const [category, channels] of categoryGroups) {
+      const existingCount = channels.filter((c) =>
+        existingChannelNames.has(c.stoatName.toLowerCase())
+      ).length;
+      catPlan += `**${category ?? "No Category"}** — ${existingCount}/${channels.length} channels exist\n`;
+    }
+    previewEmbed.addFields({
+      name: "Category Organization",
+      value: (catPlan || "No categories to organize").slice(0, 1024),
+    });
+  } else {
+    // Channels to create
+    if (selectedChannels.length > 0) {
+      const categoryGroups = groupByCategory(selectedChannels);
+      let channelList = "";
+      for (const [category, channels] of categoryGroups) {
+        channelList += `**${category ?? "No Category"}**\n`;
+        for (const ch of channels) {
+          const icon = ch.stoatType === "Voice" ? "🔊" : "#";
+          channelList += `  ${icon} ${ch.stoatName}\n`;
+        }
+      }
+      previewEmbed.addFields({
+        name: `Channels to create (${selectedChannels.length})`,
+        value: channelList.slice(0, 1024) || "None",
+      });
+    }
+
+    // Skipped channels
+    if (skippedChannels.length > 0 && mode !== "roles") {
+      previewEmbed.addFields({
+        name: `Channels skipped (${skippedChannels.length})`,
+        value: skippedChannels
+          .slice(0, 15)
+          .map((c) => `~~${c.stoatName}~~ (exists)`)
+          .join(", ")
+          .slice(0, 1024) +
+          (skippedChannels.length > 15 ? ` +${skippedChannels.length - 15} more` : ""),
+      });
+    }
+
+    // Roles to create
+    if (selectedRoles.length > 0) {
+      const roleList = selectedRoles
+        .map((r) => {
+          const color = r.stoatColor ? ` (${r.stoatColor})` : "";
+          return `• ${r.stoatName}${color}`;
+        })
+        .join("\n");
+      previewEmbed.addFields({
+        name: `Roles to create (${selectedRoles.length})`,
+        value: roleList.slice(0, 1024) || "None",
+      });
+    }
+
+    // Skipped roles
+    if (skippedRoles.length > 0 && mode !== "categories") {
+      previewEmbed.addFields({
+        name: `Roles skipped (${skippedRoles.length})`,
+        value: skippedRoles
+          .slice(0, 15)
+          .map((r) => `~~${r.stoatName}~~ (exists)`)
+          .join(", ")
+          .slice(0, 1024) +
+          (skippedRoles.length > 15 ? ` +${skippedRoles.length - 15} more` : ""),
+      });
     }
   }
-  if (channelList.length > 1024) {
-    channelList = channelList.slice(0, 1020) + "...";
-  }
-  previewEmbed.addFields({
-    name: `Channels (${channelMappings.length})`,
-    value: channelList || "None",
-    inline: false,
-  });
 
-  // Role list
-  let roleList = roleMappings
-    .map((r) => {
-      const color = r.stoatColor ? ` (${r.stoatColor})` : "";
-      return `• ${r.stoatName}${color}`;
-    })
-    .join("\n");
-  if (roleList.length > 1024) {
-    roleList = roleList.slice(0, 1020) + "...";
+  // Nothing to do?
+  const totalOps = selectedChannels.length + selectedRoles.length + (mode === "categories" ? 1 : 0);
+  if (totalOps === 0 && mode !== "categories") {
+    previewEmbed
+      .setColor(0x00cc00)
+      .setDescription(
+        previewEmbed.data.description +
+          "\n\n**Everything is already migrated.** Nothing new to create."
+      );
+    await interaction.editReply({ embeds: [previewEmbed] });
+    return;
   }
-  previewEmbed.addFields({
-    name: `Roles (${roleMappings.length})`,
-    value: roleList || "None",
-    inline: false,
-  });
 
   // Estimated time
-  const totalOps = channelMappings.length + roleMappings.length;
   const estimatedSeconds = Math.ceil(totalOps * 2.5);
   previewEmbed.setFooter({
-    text: `Estimated time: ~${estimatedSeconds}s | ${totalOps} operations`,
+    text: `${totalOps} operation(s) | ~${estimatedSeconds}s estimated`,
   });
 
-  // Buttons
+  // Confirm buttons
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId("migrate_start")
-      .setLabel("Start Migration")
+      .setLabel(mode === "categories" ? "Organize Categories" : "Start Migration")
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId("migrate_cancel")
@@ -141,9 +343,21 @@ export async function startMigrationWizard(
     if (!stoatServerId) {
       const created = await stoatClient.createServer(guild.name);
       stoatServerId = created.server._id;
-      store.linkServer(guild.id, stoatServerId);
-    } else {
-      store.linkServer(guild.id, stoatServerId);
+    }
+    store.linkServer(guild.id, stoatServerId);
+
+    if (mode === "categories") {
+      // Categories-only: just organize existing channels
+      await handleCategoriesOnly(
+        interaction,
+        stoatClient,
+        store,
+        guild,
+        stoatServerId,
+        allChannels,
+        existingServer
+      );
+      return;
     }
 
     // Execute migration with progress updates
@@ -152,10 +366,9 @@ export async function startMigrationWizard(
       store,
       guild.id,
       stoatServerId,
-      channelMappings,
-      roleMappings,
+      allChannels, // executeMigration respects the `selected` flag
+      allRoles,
       async (progress: MigrationProgress) => {
-        // Update progress embed every few steps to avoid rate limits
         if (
           progress.completedSteps % 3 === 0 ||
           progress.completedSteps === progress.totalSteps
@@ -188,8 +401,7 @@ export async function startMigrationWizard(
     );
 
     // Final results embed
-    const successCount =
-      result.totalSteps - result.errors.length - 1; // -1 for categories step
+    const successCount = result.totalSteps - result.errors.length - 1; // -1 for categories step
     const resultEmbed = new EmbedBuilder()
       .setTitle("Migration Complete")
       .setColor(result.errors.length > 0 ? 0xffaa00 : 0x00cc00)
@@ -202,6 +414,11 @@ export async function startMigrationWizard(
         {
           name: "Created",
           value: `${successCount} items`,
+          inline: true,
+        },
+        {
+          name: "Skipped",
+          value: `${skippedChannels.length + skippedRoles.length} (already exist)`,
           inline: true,
         },
         {
@@ -240,8 +457,130 @@ export async function startMigrationWizard(
   }
 }
 
+/**
+ * Categories-only mode: don't create any channels or roles,
+ * just organize existing Stoat channels into categories matching Discord's layout.
+ */
+async function handleCategoriesOnly(
+  interaction: ChatInputCommandInteraction,
+  stoatClient: StoatClient,
+  store: Store,
+  guild: Guild,
+  stoatServerId: string,
+  allChannels: ReturnType<typeof mapDiscordChannels>,
+  existingServer: StoatServer | null
+): Promise<void> {
+  if (!existingServer) {
+    await interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle("Cannot Organize Categories")
+          .setDescription("No existing Stoat server found. Run `/migrate` without `categories` mode first.")
+          .setColor(0xff0000),
+      ],
+    });
+    return;
+  }
+
+  // Build a name→id map of existing Stoat channels
+  const stoatChannelMap = new Map<string, string>(); // lowercase name → channel id
+  for (const chId of existingServer.channels) {
+    try {
+      const ch = await stoatClient.getChannel(chId);
+      if (ch.name) stoatChannelMap.set(ch.name.toLowerCase(), ch._id);
+    } catch {
+      // skip deleted channels
+    }
+  }
+
+  // Group Discord channels by category and resolve to Stoat channel IDs
+  const categoryGroups = groupByCategory(allChannels);
+  const categories: Array<{ id: string; title: string; channels: string[] }> = [];
+
+  for (const [categoryName, channels] of categoryGroups) {
+    if (!categoryName) continue; // skip uncategorized
+
+    const stoatIds: string[] = [];
+    for (const ch of channels) {
+      const stoatId = stoatChannelMap.get(ch.stoatName.toLowerCase());
+      if (stoatId) stoatIds.push(stoatId);
+    }
+
+    if (stoatIds.length > 0) {
+      categories.push({
+        id: generateCategoryId(),
+        title: categoryName,
+        channels: stoatIds,
+      });
+    }
+  }
+
+  if (categories.length === 0) {
+    await interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle("No Categories to Create")
+          .setDescription("No matching channels found to organize into categories.")
+          .setColor(0x888888),
+      ],
+    });
+    return;
+  }
+
+  try {
+    await stoatClient.editServer(stoatServerId, { categories });
+    store.logMigration(guild.id, "categories_set", null, stoatServerId, "success");
+
+    const summary = categories
+      .map((c) => `**${c.title}** — ${c.channels.length} channel(s)`)
+      .join("\n");
+
+    await interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle("Categories Organized")
+          .setDescription(summary)
+          .setColor(0x00cc00)
+          .addFields({
+            name: "Total",
+            value: `${categories.length} categories created`,
+          }),
+      ],
+      components: [],
+    });
+  } catch (err) {
+    store.logMigration(
+      guild.id,
+      "categories_set",
+      null,
+      stoatServerId,
+      "error",
+      String(err)
+    );
+    await interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle("Category Organization Failed")
+          .setDescription(`Error: ${err}`)
+          .setColor(0xff0000),
+      ],
+      components: [],
+    });
+  }
+}
+
 function buildProgressBar(pct: number): string {
   const filled = Math.round(pct / 5);
   const empty = 20 - filled;
   return `[${"█".repeat(filled)}${"░".repeat(empty)}]`;
+}
+
+/** Generate a random category ID (Revolt uses short alphanumeric IDs) */
+function generateCategoryId(): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let id = "";
+  for (let i = 0; i < 12; i++) {
+    id += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return id;
 }

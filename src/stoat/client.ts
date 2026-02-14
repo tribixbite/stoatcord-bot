@@ -79,6 +79,10 @@ export class StoatClient {
     );
   }
 
+  async getChannel(id: string): Promise<Channel> {
+    return this.request<Channel>("GET", `/channels/${id}`);
+  }
+
   async editChannel(
     id: string,
     data: Partial<EditChannelRequest>

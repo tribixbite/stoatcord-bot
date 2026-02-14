@@ -23,6 +23,18 @@ export const commands: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
         )
         .setRequired(false)
     )
+    .addStringOption((opt) =>
+      opt
+        .setName("mode")
+        .setDescription("What to migrate (default: missing — skip existing)")
+        .setRequired(false)
+        .addChoices(
+          { name: "Missing only (skip existing channels/roles)", value: "missing" },
+          { name: "Roles only", value: "roles" },
+          { name: "Categories only (organize existing channels)", value: "categories" },
+          { name: "Everything (creates duplicates!)", value: "all" }
+        )
+    )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .toJSON(),
 
