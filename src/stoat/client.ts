@@ -40,6 +40,10 @@ export class StoatClient {
     return this.request<User>("GET", "/users/@me");
   }
 
+  async fetchUser(userId: string): Promise<User> {
+    return this.request<User>("GET", `/users/${userId}`);
+  }
+
   // --- Servers ---
 
   async createServer(

@@ -40,7 +40,7 @@ async function main(): Promise<void> {
   stoatWs.connect();
 
   // Set up Stoat→Discord message relay
-  setupStoatToDiscordRelay(stoatWs, store, config.stoatCdnUrl);
+  setupStoatToDiscordRelay(stoatWs, store, config.stoatCdnUrl, stoatClient);
 
   // Create Discord client
   const discordClient = createDiscordClient();

@@ -5,6 +5,7 @@ import type { StoatClient } from "../stoat/client.ts";
 import type { StoatWebSocket } from "../stoat/websocket.ts";
 import type { Store } from "../db/store.ts";
 import type { BonfireMessageEvent } from "../stoat/types.ts";
+import type { User } from "../stoat/types.ts";
 import {
   discordToRevolt,
   revoltToDiscord,
@@ -16,6 +17,29 @@ import { sendViaWebhook } from "./webhooks.ts";
 // Track message IDs we've bridged to prevent echo loops
 const recentBridgedIds = new Set<string>();
 const BRIDGE_ID_TTL = 60_000; // 60 seconds
+
+// User cache to avoid repeated API lookups for display names/avatars
+const userCache = new Map<string, { user: User; fetchedAt: number }>();
+const USER_CACHE_TTL = 300_000; // 5 minutes
+
+/** Resolve a Stoat user by ID, using cache to avoid excessive API calls */
+async function resolveUser(
+  userId: string,
+  stoatClient: StoatClient
+): Promise<User | null> {
+  const cached = userCache.get(userId);
+  if (cached && Date.now() - cached.fetchedAt < USER_CACHE_TTL) {
+    return cached.user;
+  }
+  try {
+    const user = await stoatClient.fetchUser(userId);
+    userCache.set(userId, { user, fetchedAt: Date.now() });
+    return user;
+  } catch (err) {
+    console.warn(`[bridge] Could not resolve user ${userId}:`, err);
+    return null;
+  }
+}
 
 function markBridged(id: string): void {
   recentBridgedIds.add(id);
@@ -75,7 +99,8 @@ export async function relayDiscordToStoat(
 export function setupStoatToDiscordRelay(
   stoatWs: StoatWebSocket,
   store: Store,
-  stoatCdnUrl: string
+  stoatCdnUrl: string,
+  stoatClient?: StoatClient
 ): void {
   stoatWs.on("message", async (event: BonfireMessageEvent) => {
     // Skip messages we bridged TO Stoat (prevent echo)
@@ -112,11 +137,18 @@ export function setupStoatToDiscordRelay(
     content = truncateForDiscord(content.trim());
     if (!content) return;
 
-    // Build avatar URL from Stoat CDN
-    // TODO: Resolve user from cache/API to get avatar
-    // For now, use default avatar
-    const avatarUrl = undefined;
-    const username = `stoat-user`; // TODO: resolve from user cache
+    // Resolve user display name and avatar from Stoat API (cached)
+    let username = "stoat-user";
+    let avatarUrl: string | undefined;
+    if (stoatClient) {
+      const user = await resolveUser(event.author, stoatClient);
+      if (user) {
+        username = user.display_name || user.username;
+        if (user.avatar) {
+          avatarUrl = `${stoatCdnUrl}/avatars/${user.avatar._id}`;
+        }
+      }
+    }
 
     try {
       await sendViaWebhook(
