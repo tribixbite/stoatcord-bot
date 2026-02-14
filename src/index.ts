@@ -8,6 +8,7 @@ import { registerDiscordEvents } from "./discord/events.ts";
 import { StoatClient } from "./stoat/client.ts";
 import { StoatWebSocket } from "./stoat/websocket.ts";
 import { setupStoatToDiscordRelay } from "./bridge/relay.ts";
+import { handleListGuilds, handleGuildChannels } from "./api/server.ts";
 
 async function main(): Promise<void> {
   // Load and validate config from .env
@@ -54,6 +55,58 @@ async function main(): Promise<void> {
   if (discordClient.user) {
     await registerCommands(config.discordToken, discordClient.user.id);
   }
+
+  // Start HTTP API server for Stoat app integration
+  const apiPort = parseInt(process.env["API_PORT"] || "3210", 10);
+  const apiKey = process.env["API_KEY"] || "";
+
+  Bun.serve({
+    port: apiPort,
+    async fetch(req) {
+      const url = new URL(req.url);
+
+      // Auth check — require API key if configured
+      if (apiKey && req.headers.get("x-api-key") !== apiKey) {
+        return Response.json({ error: "Unauthorized" }, { status: 401 });
+      }
+
+      // CORS headers for mobile app
+      const corsHeaders = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "x-api-key, content-type",
+      };
+
+      if (req.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: corsHeaders });
+      }
+
+      // Route: GET /api/guilds
+      if (url.pathname === "/api/guilds" && req.method === "GET") {
+        const res = handleListGuilds(discordClient);
+        // Add CORS headers
+        const body = await res.text();
+        return new Response(body, {
+          status: res.status,
+          headers: { ...corsHeaders, "content-type": "application/json" },
+        });
+      }
+
+      // Route: GET /api/guilds/:id/channels
+      const channelMatch = url.pathname.match(/^\/api\/guilds\/(\d+)\/channels$/);
+      if (channelMatch && req.method === "GET") {
+        const guildId = channelMatch[1]!;
+        const res = await handleGuildChannels(discordClient, guildId);
+        const body = await res.text();
+        return new Response(body, {
+          status: res.status,
+          headers: { ...corsHeaders, "content-type": "application/json" },
+        });
+      }
+
+      return Response.json({ error: "Not found" }, { status: 404 });
+    },
+  });
+  console.log(`[api] HTTP API listening on port ${apiPort}`);
 
   // Status summary
   const linkedChannels = store.getLinkedChannelCount();
