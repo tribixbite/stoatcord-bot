@@ -6,6 +6,7 @@ import {
   type ServerLinkRow,
   type ChannelLinkRow,
   type RoleLinkRow,
+  type ClaimCodeRow,
   type MigrationLogRow,
 } from "./schema.ts";
 
@@ -158,6 +159,52 @@ export class Store {
       .all(guildId);
   }
 
+  // --- Claim Codes ---
+
+  /** Generate a one-time claim code for linking a Stoat server to a Discord guild */
+  createClaimCode(stoatServerId: string): string {
+    const code = generateCode();
+    this.db
+      .query(
+        "INSERT INTO claim_codes (stoat_server_id, code) VALUES (?, ?)"
+      )
+      .run(stoatServerId, code);
+    return code;
+  }
+
+  /** Validate and consume a claim code. Returns the Stoat server ID if valid. */
+  consumeClaimCode(code: string, guildId: string): string | null {
+    const row = this.db
+      .query<ClaimCodeRow, [string]>(
+        "SELECT * FROM claim_codes WHERE code = ? AND used_by_guild IS NULL"
+      )
+      .get(code);
+    if (!row) return null;
+
+    // Expire codes older than 1 hour
+    const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
+    if (row.created_at < oneHourAgo) {
+      this.db.query("DELETE FROM claim_codes WHERE code = ?").run(code);
+      return null;
+    }
+
+    // Mark as used
+    this.db
+      .query(
+        "UPDATE claim_codes SET used_by_guild = ?, used_at = unixepoch() WHERE code = ?"
+      )
+      .run(guildId, code);
+    return row.stoat_server_id;
+  }
+
+  /** Clean up expired claim codes (older than 1 hour) */
+  cleanExpiredCodes(): void {
+    const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
+    this.db
+      .query("DELETE FROM claim_codes WHERE created_at < ? AND used_by_guild IS NULL")
+      .run(oneHourAgo);
+  }
+
   // --- Migration Log ---
 
   logMigration(
@@ -203,4 +250,14 @@ export class Store {
       .get();
     return row?.count ?? 0;
   }
+}
+
+/** Generate a 6-char alphanumeric claim code (uppercase for readability) */
+function generateCode(): string {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I confusion
+  let code = "";
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
 }

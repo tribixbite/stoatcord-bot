@@ -154,6 +154,32 @@ async function main(): Promise<void> {
           );
         }
 
+        // Route: POST /api/claim-code — generate a one-time claim code for a Stoat server
+        if (url.pathname === "/api/claim-code" && method === "POST") {
+          const body = (await req.json()) as { stoatServerId: string };
+          if (!body.stoatServerId) {
+            return Response.json(
+              { error: "stoatServerId is required" },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+          // Verify the bot can access this Stoat server
+          try {
+            await stoatClient.getServer(body.stoatServerId);
+          } catch {
+            return Response.json(
+              { error: "Bot cannot access that Stoat server" },
+              { status: 404, headers: corsHeaders }
+            );
+          }
+          store.cleanExpiredCodes();
+          const code = store.createClaimCode(body.stoatServerId);
+          return addHeaders(
+            Response.json({ code, expiresIn: "1 hour" }),
+            corsHeaders
+          );
+        }
+
         // 404
         return Response.json({ error: "Not found" }, {
           status: 404,

@@ -28,15 +28,15 @@ export async function startMigrationWizard(
   store: Store,
   stoatClient: StoatClient,
   existingStoatServerId?: string,
-  mode: MigrateMode = "missing"
+  mode: MigrateMode = "missing",
+  claimCode?: string
 ): Promise<void> {
   await interaction.deferReply();
 
   // --- Security checks ---
 
   if (existingStoatServerId) {
-    // 1. Verify the bot can access the target Stoat server (must be a member)
-    //    Actual write permissions are enforced by the Stoat API on each operation
+    // 1. Verify the bot can access the target Stoat server
     try {
       await stoatClient.getServer(existingStoatServerId);
     } catch (err) {
@@ -71,6 +71,70 @@ export async function startMigrationWizard(
         ],
       });
       return;
+    }
+
+    // 3. Authorization: if this guild isn't already linked to this Stoat server,
+    //    require a one-time claim code to prove the Discord admin controls the Stoat server.
+    //    Codes are generated via POST /api/claim-code (requires API key + Stoat server access).
+    const currentLink = store.getServerLink(guild.id);
+    const alreadyLinked = currentLink?.stoat_server_id === existingStoatServerId;
+
+    if (!alreadyLinked) {
+      if (!claimCode) {
+        await interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setTitle("Claim Code Required")
+              .setDescription(
+                `To migrate into an existing Stoat server for the first time, ` +
+                `you need a one-time **claim code**.\n\n` +
+                `Generate one via the bot API:\n` +
+                `\`\`\`\nPOST /api/claim-code\n{"stoatServerId": "${existingStoatServerId}"}\n\`\`\`\n` +
+                `Then run:\n` +
+                `\`/migrate stoat_server_id:${existingStoatServerId} claim_code:XXXXXX\``
+              )
+              .setColor(0xff9900),
+          ],
+        });
+        return;
+      }
+
+      // Validate the claim code
+      const claimedServerId = store.consumeClaimCode(claimCode.toUpperCase(), guild.id);
+      if (!claimedServerId) {
+        await interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setTitle("Invalid Claim Code")
+              .setDescription(
+                `The claim code \`${claimCode}\` is invalid, expired, or already used.\n` +
+                `Codes expire after 1 hour. Generate a new one via \`POST /api/claim-code\`.`
+              )
+              .setColor(0xff0000),
+          ],
+        });
+        return;
+      }
+
+      // Verify the code was for THIS Stoat server
+      if (claimedServerId !== existingStoatServerId) {
+        await interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setTitle("Claim Code Mismatch")
+              .setDescription(
+                `That claim code was generated for a different Stoat server, ` +
+                `not \`${existingStoatServerId}\`.`
+              )
+              .setColor(0xff0000),
+          ],
+        });
+        return;
+      }
+
+      console.log(
+        `[migrate] Guild ${guild.id} claimed Stoat server ${existingStoatServerId} with code ${claimCode}`
+      );
     }
   }
 

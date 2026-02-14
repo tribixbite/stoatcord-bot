@@ -23,6 +23,14 @@ export const SCHEMA_SQL = `
     server_link_guild_id TEXT NOT NULL REFERENCES server_links(discord_guild_id)
   );
 
+  CREATE TABLE IF NOT EXISTS claim_codes (
+    stoat_server_id TEXT NOT NULL,
+    code TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    used_by_guild TEXT,
+    used_at INTEGER
+  );
+
   CREATE TABLE IF NOT EXISTS migration_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id TEXT NOT NULL,
@@ -56,6 +64,14 @@ export interface RoleLinkRow {
   discord_role_id: string;
   stoat_role_id: string;
   server_link_guild_id: string;
+}
+
+export interface ClaimCodeRow {
+  stoat_server_id: string;
+  code: string;
+  created_at: number;
+  used_by_guild: string | null;
+  used_at: number | null;
 }
 
 export interface MigrationLogRow {

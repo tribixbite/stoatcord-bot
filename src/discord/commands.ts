@@ -35,6 +35,14 @@ export const commands: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
           { name: "Everything (creates duplicates!)", value: "all" }
         )
     )
+    .addStringOption((opt) =>
+      opt
+        .setName("claim_code")
+        .setDescription(
+          "One-time code to authorize migration into a Stoat server you own (from bot API)"
+        )
+        .setRequired(false)
+    )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .toJSON(),
 
