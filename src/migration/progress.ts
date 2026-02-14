@@ -31,7 +31,9 @@ export async function executeMigration(
   stoatServerId: string,
   channels: ChannelMapping[],
   roles: RoleMapping[],
-  onProgress: ProgressCallback
+  discordUserId?: string,
+  stoatUserId?: string,
+  onProgress?: ProgressCallback
 ): Promise<MigrationProgress> {
   const selectedChannels = channels.filter((c) => c.selected);
   const selectedRoles = roles.filter((r) => r.selected);
@@ -44,14 +46,14 @@ export async function executeMigration(
     errors: [],
   };
 
-  await onProgress(progress);
+  if (onProgress) await onProgress(progress);
 
   // --- Phase 1: Create roles ---
   const roleIdMap = new Map<string, string>(); // discordRoleId → stoatRoleId
 
   for (const role of selectedRoles) {
     progress.currentAction = `Creating role: ${role.stoatName}`;
-    await onProgress(progress);
+    if (onProgress) await onProgress(progress);
 
     try {
       const result = await stoatClient.createRole(stoatServerId, role.stoatName);
@@ -75,7 +77,10 @@ export async function executeMigration(
         "role_created",
         role.discordId,
         result.id,
-        "success"
+        "success",
+        undefined,
+        discordUserId,
+        stoatUserId
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -86,7 +91,9 @@ export async function executeMigration(
         role.discordId,
         null,
         "error",
-        msg
+        msg,
+        discordUserId,
+        stoatUserId
       );
     }
 
@@ -99,7 +106,7 @@ export async function executeMigration(
 
   for (const ch of selectedChannels) {
     progress.currentAction = `Creating channel: ${ch.stoatName}`;
-    await onProgress(progress);
+    if (onProgress) await onProgress(progress);
 
     try {
       const result = await stoatClient.createChannel(stoatServerId, {
@@ -113,7 +120,10 @@ export async function executeMigration(
         "channel_created",
         ch.discordId,
         result._id,
-        "success"
+        "success",
+        undefined,
+        discordUserId,
+        stoatUserId
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -127,7 +137,9 @@ export async function executeMigration(
         ch.discordId,
         null,
         "error",
-        msg
+        msg,
+        discordUserId,
+        stoatUserId
       );
     }
 
@@ -137,7 +149,7 @@ export async function executeMigration(
 
   // --- Phase 3: Set categories ---
   progress.currentAction = "Organizing categories...";
-  await onProgress(progress);
+  if (onProgress) await onProgress(progress);
 
   try {
     // Group created channels by category
@@ -167,7 +179,10 @@ export async function executeMigration(
         "categories_set",
         null,
         stoatServerId,
-        "success"
+        "success",
+        undefined,
+        discordUserId,
+        stoatUserId
       );
     }
   } catch (err) {
@@ -179,13 +194,15 @@ export async function executeMigration(
       null,
       stoatServerId,
       "error",
-      msg
+      msg,
+      discordUserId,
+      stoatUserId
     );
   }
 
   progress.completedSteps++;
   progress.currentAction = "Migration complete!";
-  await onProgress(progress);
+  if (onProgress) await onProgress(progress);
 
   return progress;
 }

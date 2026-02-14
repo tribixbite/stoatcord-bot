@@ -102,14 +102,18 @@ async function handleMigrate(
     return;
   }
 
+  const claimCode =
+    interaction.options.getString("claim_code") ?? undefined;
   const stoatServerId =
     interaction.options.getString("stoat_server_id") ?? undefined;
   const mode =
     (interaction.options.getString("mode") as "missing" | "roles" | "categories" | "all" | null) ?? "missing";
-  const claimCode =
-    interaction.options.getString("claim_code") ?? undefined;
 
-  await startMigrationWizard(interaction, guild, store, stoatClient, stoatServerId, mode, claimCode);
+  await startMigrationWizard(
+    interaction, guild, store, stoatClient,
+    stoatServerId, mode, claimCode,
+    interaction.user.id, interaction.user.tag
+  );
 }
 
 async function handleLink(

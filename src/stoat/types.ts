@@ -246,6 +246,7 @@ export interface BonfireMessageEvent {
   attachments?: AutumnResource[];
   embeds?: Embed[];
   masquerade?: Masquerade;
+  replies?: string[]; // Array of message IDs this message replies to
 }
 
 export interface BonfireMessageUpdateEvent {

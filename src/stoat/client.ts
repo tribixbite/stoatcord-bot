@@ -5,6 +5,7 @@ import type {
   User,
   Server,
   Channel,
+  Member,
   Message,
   CreateServerRequest,
   CreateServerResponse,
@@ -64,6 +65,10 @@ export class StoatClient {
     data: Partial<EditServerRequest>
   ): Promise<Server> {
     return this.request<Server>("PATCH", `/servers/${id}`, data);
+  }
+
+  async fetchMember(serverId: string, userId: string): Promise<Member> {
+    return this.request<Member>("GET", `/servers/${serverId}/members/${userId}`);
   }
 
   // --- Channels ---

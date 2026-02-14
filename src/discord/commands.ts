@@ -17,9 +17,17 @@ export const commands: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
     )
     .addStringOption((opt) =>
       opt
+        .setName("claim_code")
+        .setDescription(
+          "One-time code from a Stoat admin (includes server — no server ID needed)"
+        )
+        .setRequired(false)
+    )
+    .addStringOption((opt) =>
+      opt
         .setName("stoat_server_id")
         .setDescription(
-          "Existing Stoat server ID to migrate into (or leave blank to create new)"
+          "Stoat server ID — triggers live approval if no code provided"
         )
         .setRequired(false)
     )
@@ -34,14 +42,6 @@ export const commands: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
           { name: "Categories only (organize existing channels)", value: "categories" },
           { name: "Everything (creates duplicates!)", value: "all" }
         )
-    )
-    .addStringOption((opt) =>
-      opt
-        .setName("claim_code")
-        .setDescription(
-          "One-time code to authorize migration into a Stoat server you own (from bot API)"
-        )
-        .setRequired(false)
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .toJSON(),

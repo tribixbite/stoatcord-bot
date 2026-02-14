@@ -11,6 +11,8 @@ import { registerDiscordEvents } from "./discord/events.ts";
 import { StoatClient } from "./stoat/client.ts";
 import { StoatWebSocket } from "./stoat/websocket.ts";
 import { setupStoatToDiscordRelay } from "./bridge/relay.ts";
+import { setupStoatCommands } from "./stoat/commands.ts";
+import { cancelAllPending } from "./migration/approval.ts";
 import { handleListGuilds, handleGuildChannels } from "./api/server.ts";
 import {
   handleListLinks,
@@ -30,15 +32,24 @@ async function main(): Promise<void> {
   // Initialize Stoat REST client
   const stoatClient = new StoatClient(config.stoatToken, config.stoatApiBase);
 
-  // Verify Stoat bot token
+  // Verify Stoat bot token and store bot user ID for command detection
+  let botSelfId: string;
   try {
     const self = await stoatClient.getSelf();
+    botSelfId = self._id;
     console.log(
-      `[stoat] Authenticated as ${self.display_name ?? self.username}#${self.discriminator}`
+      `[stoat] Authenticated as ${self.display_name ?? self.username}#${self.discriminator} (${botSelfId})`
     );
   } catch (err) {
     console.error("[stoat] Failed to authenticate:", err);
     process.exit(1);
+  }
+
+  // Startup cleanup — expire stale codes and pending migration requests
+  store.cleanExpiredCodes();
+  const expiredReqs = store.cleanExpiredRequests();
+  if (expiredReqs > 0) {
+    console.log(`[db] Cleaned ${expiredReqs} expired migration request(s)`);
   }
 
   // Connect Stoat WebSocket for realtime events
@@ -48,11 +59,15 @@ async function main(): Promise<void> {
   });
   stoatWs.connect();
 
+  // Create Discord client (needed before setting up Stoat commands that reference it)
+  const discordClient = createDiscordClient();
+
+  // Set up Stoat-side command handler (!stoatcord code, request, status, help)
+  // and reply-based migration approval detection
+  setupStoatCommands(stoatWs, store, stoatClient, botSelfId, discordClient);
+
   // Set up Stoat→Discord message relay
   setupStoatToDiscordRelay(stoatWs, store, config.stoatCdnUrl, stoatClient);
-
-  // Create Discord client
-  const discordClient = createDiscordClient();
 
   // Register Discord event handlers (includes Discord→Stoat relay)
   registerDiscordEvents(discordClient, store, stoatClient, config.stoatCdnUrl);
@@ -156,7 +171,11 @@ async function main(): Promise<void> {
 
         // Route: POST /api/claim-code — generate a one-time claim code for a Stoat server
         if (url.pathname === "/api/claim-code" && method === "POST") {
-          const body = (await req.json()) as { stoatServerId: string };
+          const body = (await req.json()) as {
+            stoatServerId: string;
+            userId?: string;
+            channelId?: string;
+          };
           if (!body.stoatServerId) {
             return Response.json(
               { error: "stoatServerId is required" },
@@ -173,7 +192,7 @@ async function main(): Promise<void> {
             );
           }
           store.cleanExpiredCodes();
-          const code = store.createClaimCode(body.stoatServerId);
+          const code = store.createClaimCode(body.stoatServerId, body.userId, body.channelId);
           return addHeaders(
             Response.json({ code, expiresIn: "1 hour" }),
             corsHeaders
@@ -207,6 +226,7 @@ async function main(): Promise<void> {
   // Graceful shutdown
   const shutdown = () => {
     console.log("[bot] Shutting down...");
+    cancelAllPending(); // reject any in-flight approval promises
     server.stop();
     stoatWs.disconnect();
     discordClient.destroy();

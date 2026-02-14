@@ -11,16 +11,29 @@ import {
 } from "discord.js";
 import type { Store } from "../db/store.ts";
 import type { StoatClient } from "../stoat/client.ts";
-import type { Server as StoatServer, Channel as StoatChannel } from "../stoat/types.ts";
+import type { Server as StoatServer } from "../stoat/types.ts";
 import { mapDiscordChannels, groupByCategory } from "./channels.ts";
 import { mapDiscordRoles } from "./roles.ts";
 import { executeMigration, type MigrationProgress } from "./progress.ts";
+import { waitForApproval } from "./approval.ts";
 
 export type MigrateMode = "missing" | "roles" | "categories" | "all";
 
+/** Auth method resolved during authorization checks */
+type AuthResult =
+  | { method: "new_server"; stoatServerId: undefined; stoatUserId: undefined }
+  | { method: "claim_code"; stoatServerId: string; stoatUserId: string | null }
+  | { method: "live_approval"; stoatServerId: string; stoatUserId: string };
+
 /**
  * Start the interactive migration wizard.
- * Fetches existing Stoat server state to diff and avoid duplicates.
+ * Three authorization paths:
+ *   A) No server ID, no code — create a new Stoat server (bot-owned)
+ *   B) Claim code provided — code validates identity + encodes server ID
+ *   C) Server ID without code — live approval from Stoat server admin
+ *
+ * Every migration into an existing server requires fresh authorization.
+ * No "already linked" bypass — re-runs always re-auth.
  */
 export async function startMigrationWizard(
   interaction: ChatInputCommandInteraction,
@@ -29,14 +42,103 @@ export async function startMigrationWizard(
   stoatClient: StoatClient,
   existingStoatServerId?: string,
   mode: MigrateMode = "missing",
-  claimCode?: string
+  claimCode?: string,
+  discordUserId?: string,
+  discordUserName?: string
 ): Promise<void> {
   await interaction.deferReply();
 
-  // --- Security checks ---
+  const userId = discordUserId ?? interaction.user.id;
+  const userName = discordUserName ?? interaction.user.tag;
 
-  if (existingStoatServerId) {
-    // 1. Verify the bot can access the target Stoat server
+  // --- Authorization: resolve which path we're taking ---
+  let auth: AuthResult;
+
+  if (claimCode) {
+    // PATH B: Claim code provided — validates identity and encodes server ID
+    const normalizedCode = claimCode.toUpperCase().trim();
+
+    const claimedServerId = store.consumeClaimCode(normalizedCode, guild.id, userId);
+    if (!claimedServerId) {
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("Invalid Claim Code")
+            .setDescription(
+              `The claim code \`${normalizedCode}\` is invalid, expired, or already used.\n` +
+              `Codes expire after 1 hour.\n\n` +
+              `Ask a Stoat server admin to generate a new code with \`!stoatcord code\`.`
+            )
+            .setColor(0xff0000),
+        ],
+      });
+      return;
+    }
+
+    // If stoat_server_id was also provided, verify it matches the code's server
+    if (existingStoatServerId && claimedServerId !== existingStoatServerId) {
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("Claim Code Mismatch")
+            .setDescription(
+              `That claim code was generated for Stoat server \`${claimedServerId}\`, ` +
+              `not \`${existingStoatServerId}\`.\n\n` +
+              `Tip: you don't need to provide \`stoat_server_id\` when using a code — the code includes the server.`
+            )
+            .setColor(0xff0000),
+        ],
+      });
+      return;
+    }
+
+    // Verify bot can access the target server
+    try {
+      await stoatClient.getServer(claimedServerId);
+    } catch (err) {
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("Cannot Access Stoat Server")
+            .setDescription(
+              `The bot cannot access Stoat server \`${claimedServerId}\`.\n` +
+              `Make sure the bot is a member of the server.\n\nError: ${err}`
+            )
+            .setColor(0xff0000),
+        ],
+      });
+      return;
+    }
+
+    // Check cross-guild binding — another guild can't claim the same server
+    const existingLink = store.getGuildForStoatServer(claimedServerId);
+    if (existingLink && existingLink.discord_guild_id !== guild.id) {
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("Server Already Linked")
+            .setDescription(
+              `Stoat server \`${claimedServerId}\` is already linked to ` +
+              `a different Discord guild. Each Stoat server can only be linked to one Discord guild.`
+            )
+            .setColor(0xff0000),
+        ],
+      });
+      return;
+    }
+
+    // Look up who created the code for audit trail
+    const codeRow = store.getClaimCode(normalizedCode);
+    const stoatUserId = codeRow?.created_by_stoat_user ?? null;
+
+    console.log(
+      `[migrate] Guild ${guild.id} claimed Stoat server ${claimedServerId} with code ${normalizedCode} (Discord user: ${userId})`
+    );
+
+    auth = { method: "claim_code", stoatServerId: claimedServerId, stoatUserId };
+
+  } else if (existingStoatServerId) {
+    // PATH C: Live approval — send request to Stoat server, wait for admin reply
     try {
       await stoatClient.getServer(existingStoatServerId);
     } catch (err) {
@@ -45,9 +147,8 @@ export async function startMigrationWizard(
           new EmbedBuilder()
             .setTitle("Cannot Access Stoat Server")
             .setDescription(
-              `The bot cannot access Stoat server \`${existingStoatServerId}\`. ` +
-              `Make sure the bot is a member of the server.\n\n` +
-              `Error: ${err}`
+              `The bot cannot access Stoat server \`${existingStoatServerId}\`.\n` +
+              `Make sure the bot is a member of the server.\n\nError: ${err}`
             )
             .setColor(0xff0000),
         ],
@@ -55,7 +156,7 @@ export async function startMigrationWizard(
       return;
     }
 
-    // 2. Check if this Stoat server is already linked to a DIFFERENT Discord guild
+    // Cross-guild binding check
     const existingLink = store.getGuildForStoatServer(existingStoatServerId);
     if (existingLink && existingLink.discord_guild_id !== guild.id) {
       await interaction.editReply({
@@ -64,8 +165,7 @@ export async function startMigrationWizard(
             .setTitle("Server Already Linked")
             .setDescription(
               `Stoat server \`${existingStoatServerId}\` is already linked to ` +
-              `Discord guild \`${existingLink.discord_guild_id}\`. ` +
-              `Each Stoat server can only be linked to one Discord guild.`
+              `a different Discord guild. Each Stoat server can only be linked to one Discord guild.`
             )
             .setColor(0xff0000),
         ],
@@ -73,69 +173,127 @@ export async function startMigrationWizard(
       return;
     }
 
-    // 3. Authorization: if this guild isn't already linked to this Stoat server,
-    //    require a one-time claim code to prove the Discord admin controls the Stoat server.
-    //    Codes are generated via POST /api/claim-code (requires API key + Stoat server access).
-    const currentLink = store.getServerLink(guild.id);
-    const alreadyLinked = currentLink?.stoat_server_id === existingStoatServerId;
-
-    if (!alreadyLinked) {
-      if (!claimCode) {
-        await interaction.editReply({
-          embeds: [
-            new EmbedBuilder()
-              .setTitle("Claim Code Required")
-              .setDescription(
-                `To migrate into an existing Stoat server for the first time, ` +
-                `you need a one-time **claim code**.\n\n` +
-                `Generate one via the bot API:\n` +
-                `\`\`\`\nPOST /api/claim-code\n{"stoatServerId": "${existingStoatServerId}"}\n\`\`\`\n` +
-                `Then run:\n` +
-                `\`/migrate stoat_server_id:${existingStoatServerId} claim_code:XXXXXX\``
-              )
-              .setColor(0xff9900),
-          ],
-        });
-        return;
-      }
-
-      // Validate the claim code
-      const claimedServerId = store.consumeClaimCode(claimCode.toUpperCase(), guild.id);
-      if (!claimedServerId) {
-        await interaction.editReply({
-          embeds: [
-            new EmbedBuilder()
-              .setTitle("Invalid Claim Code")
-              .setDescription(
-                `The claim code \`${claimCode}\` is invalid, expired, or already used.\n` +
-                `Codes expire after 1 hour. Generate a new one via \`POST /api/claim-code\`.`
-              )
-              .setColor(0xff0000),
-          ],
-        });
-        return;
-      }
-
-      // Verify the code was for THIS Stoat server
-      if (claimedServerId !== existingStoatServerId) {
-        await interaction.editReply({
-          embeds: [
-            new EmbedBuilder()
-              .setTitle("Claim Code Mismatch")
-              .setDescription(
-                `That claim code was generated for a different Stoat server, ` +
-                `not \`${existingStoatServerId}\`.`
-              )
-              .setColor(0xff0000),
-          ],
-        });
-        return;
-      }
-
-      console.log(
-        `[migrate] Guild ${guild.id} claimed Stoat server ${existingStoatServerId} with code ${claimCode}`
-      );
+    // Cancel any existing pending request for this Stoat server
+    const existingReq = store.getPendingRequestForServer(existingStoatServerId);
+    if (existingReq) {
+      store.resolveMigrationRequest(existingReq.id, "cancelled");
     }
+
+    // Find a text channel to post the approval request in
+    const server = await stoatClient.getServer(existingStoatServerId);
+    let targetChannelId: string | null = null;
+
+    // Prefer system messages channel, then first text channel
+    if (server.system_messages?.user_joined) {
+      targetChannelId = server.system_messages.user_joined;
+    }
+    if (!targetChannelId && server.channels.length > 0) {
+      // Find first text channel the bot can post in
+      for (const chId of server.channels) {
+        try {
+          const ch = await stoatClient.getChannel(chId);
+          if (ch.channel_type === "TextChannel") {
+            targetChannelId = chId;
+            break;
+          }
+        } catch {
+          // skip inaccessible channels
+        }
+      }
+    }
+
+    if (!targetChannelId) {
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("No Text Channel Found")
+            .setDescription(
+              `Could not find a text channel in Stoat server \`${existingStoatServerId}\` ` +
+              `to post the approval request.\n\n` +
+              `Ask a Stoat server admin to generate a code with \`!stoatcord code\` instead.`
+            )
+            .setColor(0xff0000),
+        ],
+      });
+      return;
+    }
+
+    // Create DB record for the migration request
+    const requestId = generateRequestId();
+    const expiresAt = Math.floor(Date.now() / 1000) + 300; // 5 minutes
+
+    store.createMigrationRequest({
+      id: requestId,
+      discordGuildId: guild.id,
+      discordGuildName: guild.name,
+      discordUserId: userId,
+      discordUserName: userName,
+      stoatServerId: existingStoatServerId,
+      stoatChannelId: targetChannelId,
+      expiresAt,
+    });
+
+    // Send approval request message to the Stoat channel
+    const approvalMsg = await stoatClient.sendMessage(
+      targetChannelId,
+      `**Migration Approval Request**\n\n` +
+      `Discord guild **${guild.name}** (\`${guild.id}\`) wants to link with this Stoat server.\n` +
+      `Requested by Discord user **${userName}**.\n\n` +
+      `A server admin must **reply to this message** with:\n` +
+      `- \`approve\` / \`yes\` / \`confirm\` — to allow the migration\n` +
+      `- \`deny\` / \`reject\` / \`no\` — to block it\n\n` +
+      `This request expires in **5 minutes**.`
+    );
+
+    // Store the message ID so the reply handler can find it
+    store.setMigrationRequestMessageId(requestId, approvalMsg._id);
+
+    // Update Discord to show waiting status
+    await interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle("Waiting for Stoat Server Approval...")
+          .setDescription(
+            `An approval request has been sent to the Stoat server.\n\n` +
+            `A Stoat server admin must reply **approve** to the bot's message within 5 minutes.\n\n` +
+            `Server: \`${existingStoatServerId}\`\nChannel: \`${targetChannelId}\``
+          )
+          .setColor(0xffaa00),
+      ],
+    });
+
+    // Wait for the Stoat admin to approve (or timeout)
+    let approvedByUserId: string;
+    try {
+      approvedByUserId = await waitForApproval(approvalMsg._id, requestId, 300_000);
+    } catch (err) {
+      // Timeout or rejection
+      const errMsg = err instanceof Error ? err.message : String(err);
+      store.resolveMigrationRequest(requestId, "expired");
+
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("Migration Request Failed")
+            .setDescription(
+              `${errMsg}\n\n` +
+              `Run \`/migrate\` again to retry, or ask a Stoat admin to generate a code with \`!stoatcord code\`.`
+            )
+            .setColor(0xff0000),
+        ],
+      });
+      return;
+    }
+
+    console.log(
+      `[migrate] Live approval granted for guild ${guild.id} → server ${existingStoatServerId} by Stoat user ${approvedByUserId}`
+    );
+
+    auth = { method: "live_approval", stoatServerId: existingStoatServerId, stoatUserId: approvedByUserId };
+
+  } else {
+    // PATH A: No server ID, no code — create a new Stoat server
+    auth = { method: "new_server", stoatServerId: undefined, stoatUserId: undefined };
   }
 
   // Fetch full guild data from Discord
@@ -146,14 +304,17 @@ export async function startMigrationWizard(
   const allChannels = mapDiscordChannels(guild);
   const allRoles = mapDiscordRoles(guild);
 
+  // Resolve effective Stoat server ID from auth result
+  const effectiveStoatServerId = auth.stoatServerId;
+
   // If migrating into existing server, fetch its state for diffing
   let existingServer: StoatServer | null = null;
   let existingChannelNames = new Set<string>();
   let existingRoleNames = new Set<string>();
 
-  if (existingStoatServerId) {
+  if (effectiveStoatServerId) {
     try {
-      existingServer = await stoatClient.getServer(existingStoatServerId);
+      existingServer = await stoatClient.getServer(effectiveStoatServerId);
 
       // Fetch channel names for comparison
       for (const chId of existingServer.channels) {
@@ -181,7 +342,7 @@ export async function startMigrationWizard(
           new EmbedBuilder()
             .setTitle("Migration Error")
             .setDescription(
-              `Could not fetch Stoat server \`${existingStoatServerId}\`: ${err}`
+              `Could not fetch Stoat server \`${effectiveStoatServerId}\`: ${err}`
             )
             .setColor(0xff0000),
         ],
@@ -252,8 +413,9 @@ export async function startMigrationWizard(
     .setColor(0x4f8a5e)
     .setDescription(
       `**Mode**: ${modeLabel[mode]}\n` +
-        (existingStoatServerId
-          ? `**Target**: Existing Stoat server \`${existingStoatServerId}\``
+        `**Auth**: ${auth.method.replace("_", " ")}\n` +
+        (effectiveStoatServerId
+          ? `**Target**: Existing Stoat server \`${effectiveStoatServerId}\``
           : "**Target**: New Stoat server (will be created)")
     );
 
@@ -318,7 +480,7 @@ export async function startMigrationWizard(
     }
 
     // Skipped roles
-    if (skippedRoles.length > 0 && mode !== "categories") {
+    if (skippedRoles.length > 0) {
       previewEmbed.addFields({
         name: `Roles skipped (${skippedRoles.length})`,
         value: skippedRoles
@@ -398,13 +560,13 @@ export async function startMigrationWizard(
       components: [],
     });
 
-    // Create or use Stoat server
-    let stoatServerId = existingStoatServerId;
+    // Create or use Stoat server based on auth path
+    let stoatServerId = auth.stoatServerId;
     if (!stoatServerId) {
       const created = await stoatClient.createServer(guild.name);
       stoatServerId = created.server._id;
     }
-    store.linkServer(guild.id, stoatServerId);
+    store.linkServer(guild.id, stoatServerId, auth.method, userId, auth.stoatUserId ?? undefined);
 
     if (mode === "categories") {
       // Categories-only: just organize existing channels
@@ -415,7 +577,9 @@ export async function startMigrationWizard(
         guild,
         stoatServerId,
         allChannels,
-        existingServer
+        existingServer,
+        userId,
+        auth.stoatUserId ?? undefined
       );
       return;
     }
@@ -428,6 +592,8 @@ export async function startMigrationWizard(
       stoatServerId,
       allChannels, // executeMigration respects the `selected` flag
       allRoles,
+      userId,
+      auth.stoatUserId ?? undefined,
       async (progress: MigrationProgress) => {
         if (
           progress.completedSteps % 3 === 0 ||
@@ -528,7 +694,9 @@ async function handleCategoriesOnly(
   guild: Guild,
   stoatServerId: string,
   allChannels: ReturnType<typeof mapDiscordChannels>,
-  existingServer: StoatServer | null
+  existingServer: StoatServer | null,
+  discordUserId?: string,
+  stoatUserId?: string
 ): Promise<void> {
   if (!existingServer) {
     await interaction.editReply({
@@ -589,7 +757,7 @@ async function handleCategoriesOnly(
 
   try {
     await stoatClient.editServer(stoatServerId, { categories });
-    store.logMigration(guild.id, "categories_set", null, stoatServerId, "success");
+    store.logMigration(guild.id, "categories_set", null, stoatServerId, "success", undefined, discordUserId, stoatUserId);
 
     const summary = categories
       .map((c) => `**${c.title}** — ${c.channels.length} channel(s)`)
@@ -615,7 +783,9 @@ async function handleCategoriesOnly(
       null,
       stoatServerId,
       "error",
-      String(err)
+      String(err),
+      discordUserId,
+      stoatUserId
     );
     await interaction.editReply({
       embeds: [
@@ -643,4 +813,15 @@ function generateCategoryId(): string {
     id += chars[Math.floor(Math.random() * chars.length)];
   }
   return id;
+}
+
+/** Generate a unique request ID for migration approval tracking */
+function generateRequestId(): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const timestamp = Date.now().toString(36);
+  let random = "";
+  for (let i = 0; i < 8; i++) {
+    random += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return `mr_${timestamp}_${random}`;
 }
