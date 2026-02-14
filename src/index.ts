@@ -9,6 +9,12 @@ import { StoatClient } from "./stoat/client.ts";
 import { StoatWebSocket } from "./stoat/websocket.ts";
 import { setupStoatToDiscordRelay } from "./bridge/relay.ts";
 import { handleListGuilds, handleGuildChannels } from "./api/server.ts";
+import {
+  handleListLinks,
+  handleGuildLinks,
+  handleCreateLink,
+  handleDeleteLink,
+} from "./api/links.ts";
 
 async function main(): Promise<void> {
   // Load and validate config from .env
@@ -74,6 +80,7 @@ async function main(): Promise<void> {
       const corsHeaders = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Headers": "x-api-key, content-type",
+        "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
       };
 
       if (req.method === "OPTIONS") {
@@ -96,6 +103,51 @@ async function main(): Promise<void> {
       if (channelMatch && req.method === "GET") {
         const guildId = channelMatch[1]!;
         const res = await handleGuildChannels(discordClient, guildId);
+        const body = await res.text();
+        return new Response(body, {
+          status: res.status,
+          headers: { ...corsHeaders, "content-type": "application/json" },
+        });
+      }
+
+      // Route: GET /api/links — list all active bridge links
+      if (url.pathname === "/api/links" && req.method === "GET") {
+        const res = handleListLinks(store, discordClient);
+        const body = await res.text();
+        return new Response(body, {
+          status: res.status,
+          headers: { ...corsHeaders, "content-type": "application/json" },
+        });
+      }
+
+      // Route: GET /api/links/guild/:id — links for a specific guild
+      const guildLinksMatch = url.pathname.match(/^\/api\/links\/guild\/(\d+)$/);
+      if (guildLinksMatch && req.method === "GET") {
+        const guildId = guildLinksMatch[1]!;
+        const res = handleGuildLinks(store, discordClient, guildId);
+        const body = await res.text();
+        return new Response(body, {
+          status: res.status,
+          headers: { ...corsHeaders, "content-type": "application/json" },
+        });
+      }
+
+      // Route: POST /api/links — create a new bridge link
+      if (url.pathname === "/api/links" && req.method === "POST") {
+        const reqBody = await req.json() as { discordChannelId: string; stoatChannelId: string };
+        const res = await handleCreateLink(store, discordClient, reqBody);
+        const body = await res.text();
+        return new Response(body, {
+          status: res.status,
+          headers: { ...corsHeaders, "content-type": "application/json" },
+        });
+      }
+
+      // Route: DELETE /api/links/:discordChannelId — remove a bridge link
+      const deleteLinkMatch = url.pathname.match(/^\/api\/links\/(\d+)$/);
+      if (deleteLinkMatch && req.method === "DELETE") {
+        const discordChannelId = deleteLinkMatch[1]!;
+        const res = handleDeleteLink(store, discordChannelId);
         const body = await res.text();
         return new Response(body, {
           status: res.status,
