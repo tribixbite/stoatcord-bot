@@ -1,6 +1,8 @@
 /** stoatcord-bot — Discord↔Stoat migration & message bridge bot */
 
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+// Load .env first — grun doesn't pass env vars to child processes
+import "./env.ts";
+
 import { loadConfig } from "./config.ts";
 import { Store } from "./db/store.ts";
 import { createDiscordClient } from "./discord/client.ts";
@@ -17,36 +19,11 @@ import {
   handleDeleteLink,
 } from "./api/links.ts";
 
-/** Read full request body as string */
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString()));
-    req.on("error", reject);
-  });
-}
-
-/** Send a Web API Response object through Node's http.ServerResponse */
-async function sendResponse(
-  webRes: Response,
-  nodeRes: ServerResponse,
-  extraHeaders: Record<string, string> = {}
-): Promise<void> {
-  const body = await webRes.text();
-  const headers: Record<string, string> = {
-    "content-type": "application/json",
-    ...extraHeaders,
-  };
-  nodeRes.writeHead(webRes.status, headers);
-  nodeRes.end(body);
-}
-
 async function main(): Promise<void> {
   // Load and validate config from .env
   const config = loadConfig();
 
-  // Initialize SQLite database
+  // Initialize SQLite database (bun:sqlite)
   const store = new Store(config.dbPath);
   console.log("[db] Database initialized");
 
@@ -98,76 +75,101 @@ async function main(): Promise<void> {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
   };
 
-  const server = createServer(async (req, res) => {
-    try {
-      const url = new URL(req.url ?? "/", `http://localhost:${apiPort}`);
-      const method = req.method ?? "GET";
+  const server = Bun.serve({
+    port: apiPort,
+    async fetch(req: Request): Promise<Response> {
+      const url = new URL(req.url);
+      const method = req.method;
 
       // Auth check — require API key if configured
-      if (apiKey && req.headers["x-api-key"] !== apiKey) {
-        res.writeHead(401, { ...corsHeaders, "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "Unauthorized" }));
-        return;
+      if (apiKey && req.headers.get("x-api-key") !== apiKey) {
+        return Response.json({ error: "Unauthorized" }, {
+          status: 401,
+          headers: corsHeaders,
+        });
       }
 
       // CORS preflight
       if (method === "OPTIONS") {
-        res.writeHead(204, corsHeaders);
-        res.end();
-        return;
+        return new Response(null, { status: 204, headers: corsHeaders });
       }
 
-      // Route: GET /api/guilds
-      if (url.pathname === "/api/guilds" && method === "GET") {
-        return sendResponse(handleListGuilds(discordClient), res, corsHeaders);
-      }
+      try {
+        // Route: GET /api/guilds
+        if (url.pathname === "/api/guilds" && method === "GET") {
+          return addHeaders(handleListGuilds(discordClient), corsHeaders);
+        }
 
-      // Route: GET /api/guilds/:id/channels
-      const channelMatch = url.pathname.match(/^\/api\/guilds\/(\d+)\/channels$/);
-      if (channelMatch && method === "GET") {
-        const guildId = channelMatch[1]!;
-        return sendResponse(await handleGuildChannels(discordClient, guildId), res, corsHeaders);
-      }
+        // Route: GET /api/guilds/:id/channels
+        const channelMatch = url.pathname.match(
+          /^\/api\/guilds\/(\d+)\/channels$/
+        );
+        if (channelMatch && method === "GET") {
+          const guildId = channelMatch[1]!;
+          return addHeaders(
+            await handleGuildChannels(discordClient, guildId),
+            corsHeaders
+          );
+        }
 
-      // Route: GET /api/links — list all active bridge links
-      if (url.pathname === "/api/links" && method === "GET") {
-        return sendResponse(handleListLinks(store, discordClient), res, corsHeaders);
-      }
+        // Route: GET /api/links — list all active bridge links
+        if (url.pathname === "/api/links" && method === "GET") {
+          return addHeaders(
+            handleListLinks(store, discordClient),
+            corsHeaders
+          );
+        }
 
-      // Route: GET /api/links/guild/:id — links for a specific guild
-      const guildLinksMatch = url.pathname.match(/^\/api\/links\/guild\/(\d+)$/);
-      if (guildLinksMatch && method === "GET") {
-        const guildId = guildLinksMatch[1]!;
-        return sendResponse(handleGuildLinks(store, discordClient, guildId), res, corsHeaders);
-      }
+        // Route: GET /api/links/guild/:id — links for a specific guild
+        const guildLinksMatch = url.pathname.match(
+          /^\/api\/links\/guild\/(\d+)$/
+        );
+        if (guildLinksMatch && method === "GET") {
+          const guildId = guildLinksMatch[1]!;
+          return addHeaders(
+            handleGuildLinks(store, discordClient, guildId),
+            corsHeaders
+          );
+        }
 
-      // Route: POST /api/links — create a new bridge link
-      if (url.pathname === "/api/links" && method === "POST") {
-        const body = await readBody(req);
-        const reqBody = JSON.parse(body) as { discordChannelId: string; stoatChannelId: string };
-        return sendResponse(await handleCreateLink(store, discordClient, reqBody), res, corsHeaders);
-      }
+        // Route: POST /api/links — create a new bridge link
+        if (url.pathname === "/api/links" && method === "POST") {
+          const body = (await req.json()) as {
+            discordChannelId: string;
+            stoatChannelId: string;
+          };
+          return addHeaders(
+            await handleCreateLink(store, discordClient, body),
+            corsHeaders
+          );
+        }
 
-      // Route: DELETE /api/links/:discordChannelId — remove a bridge link
-      const deleteLinkMatch = url.pathname.match(/^\/api\/links\/(\d+)$/);
-      if (deleteLinkMatch && method === "DELETE") {
-        const discordChannelId = deleteLinkMatch[1]!;
-        return sendResponse(handleDeleteLink(store, discordChannelId), res, corsHeaders);
-      }
+        // Route: DELETE /api/links/:discordChannelId — remove a bridge link
+        const deleteLinkMatch = url.pathname.match(/^\/api\/links\/(\d+)$/);
+        if (deleteLinkMatch && method === "DELETE") {
+          const discordChannelId = deleteLinkMatch[1]!;
+          return addHeaders(
+            handleDeleteLink(store, discordChannelId),
+            corsHeaders
+          );
+        }
 
-      // 404
-      res.writeHead(404, { ...corsHeaders, "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "Not found" }));
-    } catch (err) {
-      console.error("[api] Request error:", err);
-      res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "Internal server error" }));
-    }
+        // 404
+        return Response.json({ error: "Not found" }, {
+          status: 404,
+          headers: corsHeaders,
+        });
+      } catch (err) {
+        console.error("[api] Request error:", err);
+        return Response.json({ error: "Internal server error" }, {
+          status: 500,
+          headers: corsHeaders,
+        });
+      }
+    },
   });
 
-  server.listen(apiPort, () => {
-    console.log(`[api] HTTP API listening on port ${apiPort}`);
-  });
+  console.log(`[api] HTTP API listening on port ${server.port}`);
 
   // Status summary
   const linkedChannels = store.getLinkedChannelCount();
@@ -179,7 +181,7 @@ async function main(): Promise<void> {
   // Graceful shutdown
   const shutdown = () => {
     console.log("[bot] Shutting down...");
-    server.close();
+    server.stop();
     stoatWs.disconnect();
     discordClient.destroy();
     store.close();
@@ -188,6 +190,22 @@ async function main(): Promise<void> {
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+/** Clone a Response with extra headers appended */
+function addHeaders(
+  response: Response,
+  headers: Record<string, string>
+): Response {
+  const newHeaders = new Headers(response.headers);
+  for (const [k, v] of Object.entries(headers)) {
+    newHeaders.set(k, v);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: newHeaders,
+  });
 }
 
 main().catch((err) => {

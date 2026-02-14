@@ -4,18 +4,15 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "node --env-file=.env --import=tsx src/index.ts",
-    "dev": "node --env-file=.env --import=tsx --watch src/index.ts",
+    "start": "bun src/index.ts",
+    "dev": "bun --watch src/index.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "better-sqlite3": "^12.6.2",
     "discord.js": "^14.25.1"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^25.2.3",
-    "tsx": "^4.21.0",
+    "@types/bun": "^1.2.20",
     "typescript": "^5.9.3"
   }
 }

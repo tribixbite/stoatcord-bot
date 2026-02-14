@@ -1,0 +1,4 @@
+# Local Bun config for stoatcord-bot (overrides global)
+[install]
+backend = "copyfile"
+production = false

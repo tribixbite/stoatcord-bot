@@ -1,6 +1,6 @@
 /** Stoat/Revolt REST API client with rate limit handling */
 
-import { sleep } from "../util.ts";
+import { sleep } from "../util.ts"; // re-exports Bun.sleep
 import type {
   User,
   Server,

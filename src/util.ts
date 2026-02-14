@@ -1,6 +1,4 @@
-/** Portable utility functions (Node.js compatible) */
+/** Shared utility functions */
 
-/** Promise-based sleep, replacing Bun.sleep */
-export function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+// Re-export Bun.sleep for convenience — used across rate-limit waiters
+export const sleep = Bun.sleep;
