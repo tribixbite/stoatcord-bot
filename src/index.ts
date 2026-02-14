@@ -1,5 +1,6 @@
 /** stoatcord-bot — Discord↔Stoat migration & message bridge bot */
 
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { loadConfig } from "./config.ts";
 import { Store } from "./db/store.ts";
 import { createDiscordClient } from "./discord/client.ts";
@@ -15,6 +16,31 @@ import {
   handleCreateLink,
   handleDeleteLink,
 } from "./api/links.ts";
+
+/** Read full request body as string */
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString()));
+    req.on("error", reject);
+  });
+}
+
+/** Send a Web API Response object through Node's http.ServerResponse */
+async function sendResponse(
+  webRes: Response,
+  nodeRes: ServerResponse,
+  extraHeaders: Record<string, string> = {}
+): Promise<void> {
+  const body = await webRes.text();
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    ...extraHeaders,
+  };
+  nodeRes.writeHead(webRes.status, headers);
+  nodeRes.end(body);
+}
 
 async function main(): Promise<void> {
   // Load and validate config from .env
@@ -66,99 +92,82 @@ async function main(): Promise<void> {
   const apiPort = parseInt(process.env["API_PORT"] || "3210", 10);
   const apiKey = process.env["API_KEY"] || "";
 
-  Bun.serve({
-    port: apiPort,
-    async fetch(req) {
-      const url = new URL(req.url);
+  const corsHeaders: Record<string, string> = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "x-api-key, content-type",
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  };
+
+  const server = createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url ?? "/", `http://localhost:${apiPort}`);
+      const method = req.method ?? "GET";
 
       // Auth check — require API key if configured
-      if (apiKey && req.headers.get("x-api-key") !== apiKey) {
-        return Response.json({ error: "Unauthorized" }, { status: 401 });
+      if (apiKey && req.headers["x-api-key"] !== apiKey) {
+        res.writeHead(401, { ...corsHeaders, "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
       }
 
-      // CORS headers for mobile app
-      const corsHeaders = {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "x-api-key, content-type",
-        "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-      };
-
-      if (req.method === "OPTIONS") {
-        return new Response(null, { status: 204, headers: corsHeaders });
+      // CORS preflight
+      if (method === "OPTIONS") {
+        res.writeHead(204, corsHeaders);
+        res.end();
+        return;
       }
 
       // Route: GET /api/guilds
-      if (url.pathname === "/api/guilds" && req.method === "GET") {
-        const res = handleListGuilds(discordClient);
-        // Add CORS headers
-        const body = await res.text();
-        return new Response(body, {
-          status: res.status,
-          headers: { ...corsHeaders, "content-type": "application/json" },
-        });
+      if (url.pathname === "/api/guilds" && method === "GET") {
+        return sendResponse(handleListGuilds(discordClient), res, corsHeaders);
       }
 
       // Route: GET /api/guilds/:id/channels
       const channelMatch = url.pathname.match(/^\/api\/guilds\/(\d+)\/channels$/);
-      if (channelMatch && req.method === "GET") {
+      if (channelMatch && method === "GET") {
         const guildId = channelMatch[1]!;
-        const res = await handleGuildChannels(discordClient, guildId);
-        const body = await res.text();
-        return new Response(body, {
-          status: res.status,
-          headers: { ...corsHeaders, "content-type": "application/json" },
-        });
+        return sendResponse(await handleGuildChannels(discordClient, guildId), res, corsHeaders);
       }
 
       // Route: GET /api/links — list all active bridge links
-      if (url.pathname === "/api/links" && req.method === "GET") {
-        const res = handleListLinks(store, discordClient);
-        const body = await res.text();
-        return new Response(body, {
-          status: res.status,
-          headers: { ...corsHeaders, "content-type": "application/json" },
-        });
+      if (url.pathname === "/api/links" && method === "GET") {
+        return sendResponse(handleListLinks(store, discordClient), res, corsHeaders);
       }
 
       // Route: GET /api/links/guild/:id — links for a specific guild
       const guildLinksMatch = url.pathname.match(/^\/api\/links\/guild\/(\d+)$/);
-      if (guildLinksMatch && req.method === "GET") {
+      if (guildLinksMatch && method === "GET") {
         const guildId = guildLinksMatch[1]!;
-        const res = handleGuildLinks(store, discordClient, guildId);
-        const body = await res.text();
-        return new Response(body, {
-          status: res.status,
-          headers: { ...corsHeaders, "content-type": "application/json" },
-        });
+        return sendResponse(handleGuildLinks(store, discordClient, guildId), res, corsHeaders);
       }
 
       // Route: POST /api/links — create a new bridge link
-      if (url.pathname === "/api/links" && req.method === "POST") {
-        const reqBody = await req.json() as { discordChannelId: string; stoatChannelId: string };
-        const res = await handleCreateLink(store, discordClient, reqBody);
-        const body = await res.text();
-        return new Response(body, {
-          status: res.status,
-          headers: { ...corsHeaders, "content-type": "application/json" },
-        });
+      if (url.pathname === "/api/links" && method === "POST") {
+        const body = await readBody(req);
+        const reqBody = JSON.parse(body) as { discordChannelId: string; stoatChannelId: string };
+        return sendResponse(await handleCreateLink(store, discordClient, reqBody), res, corsHeaders);
       }
 
       // Route: DELETE /api/links/:discordChannelId — remove a bridge link
       const deleteLinkMatch = url.pathname.match(/^\/api\/links\/(\d+)$/);
-      if (deleteLinkMatch && req.method === "DELETE") {
+      if (deleteLinkMatch && method === "DELETE") {
         const discordChannelId = deleteLinkMatch[1]!;
-        const res = handleDeleteLink(store, discordChannelId);
-        const body = await res.text();
-        return new Response(body, {
-          status: res.status,
-          headers: { ...corsHeaders, "content-type": "application/json" },
-        });
+        return sendResponse(handleDeleteLink(store, discordChannelId), res, corsHeaders);
       }
 
-      return Response.json({ error: "Not found" }, { status: 404 });
-    },
+      // 404
+      res.writeHead(404, { ...corsHeaders, "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "Not found" }));
+    } catch (err) {
+      console.error("[api] Request error:", err);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "Internal server error" }));
+    }
   });
-  console.log(`[api] HTTP API listening on port ${apiPort}`);
+
+  server.listen(apiPort, () => {
+    console.log(`[api] HTTP API listening on port ${apiPort}`);
+  });
 
   // Status summary
   const linkedChannels = store.getLinkedChannelCount();
@@ -170,6 +179,7 @@ async function main(): Promise<void> {
   // Graceful shutdown
   const shutdown = () => {
     console.log("[bot] Shutting down...");
+    server.close();
     stoatWs.disconnect();
     discordClient.destroy();
     store.close();

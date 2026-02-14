@@ -1,5 +1,6 @@
 /** Rate-limit-aware batch migration executor with progress tracking */
 
+import { sleep } from "../util.ts";
 import type { StoatClient } from "../stoat/client.ts";
 import type { Store } from "../db/store.ts";
 import type { ChannelMapping } from "./channels.ts";
@@ -90,7 +91,7 @@ export async function executeMigration(
     }
 
     progress.completedSteps++;
-    await Bun.sleep(ROLE_DELAY);
+    await sleep(ROLE_DELAY);
   }
 
   // --- Phase 2: Create channels ---
@@ -131,7 +132,7 @@ export async function executeMigration(
     }
 
     progress.completedSteps++;
-    await Bun.sleep(CHANNEL_DELAY);
+    await sleep(CHANNEL_DELAY);
   }
 
   // --- Phase 3: Set categories ---

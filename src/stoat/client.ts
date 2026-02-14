@@ -1,5 +1,6 @@
 /** Stoat/Revolt REST API client with rate limit handling */
 
+import { sleep } from "../util.ts";
 import type {
   User,
   Server,
@@ -199,7 +200,7 @@ export class StoatClient {
       const retryAfter = res.headers.get("retry-after");
       const wait = retryAfter ? parseInt(retryAfter, 10) * 1000 : 5000;
       console.warn(`[stoat] Rate limited on ${path}, waiting ${wait}ms`);
-      await Bun.sleep(wait);
+      await sleep(wait);
       return this.request<T>(method, path, body);
     }
 
@@ -233,7 +234,7 @@ export class StoatClient {
     if (state.remaining <= 0 && state.resetAt > Date.now()) {
       const wait = state.resetAt - Date.now() + 100; // +100ms buffer
       console.log(`[stoat] Waiting ${wait}ms for rate limit on ${bucket}`);
-      await Bun.sleep(wait);
+      await sleep(wait);
     }
   }
 

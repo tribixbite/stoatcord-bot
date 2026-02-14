@@ -16,7 +16,7 @@
     "noImplicitOverride": true,
     "noUnusedLocals": false,
     "noUnusedParameters": false,
-    "types": ["bun-types"]
+    "types": ["node"]
   },
   "include": ["src/**/*.ts"]
 }
