@@ -84,8 +84,9 @@ export function registerDiscordEvents(
 /**
  * /migrate command handler.
  * Security: Discord enforces Administrator permission via setDefaultMemberPermissions.
- * Additional checks in wizard.ts: bot ownership of target Stoat server,
+ * Additional checks in wizard.ts: bot must be a member of target Stoat server,
  * one-to-one guild↔server binding (prevents cross-guild hijacking).
+ * Write permissions enforced by the Stoat API on each operation.
  */
 async function handleMigrate(
   interaction: ChatInputCommandInteraction,

@@ -34,29 +34,25 @@ export async function startMigrationWizard(
 
   // --- Security checks ---
 
-  // 1. If a Stoat server ID is provided, verify the bot can actually access it
-  //    (the bot's token must have permission — it owns servers it created)
   if (existingStoatServerId) {
+    // 1. Verify the bot can access the target Stoat server (must be a member)
+    //    Actual write permissions are enforced by the Stoat API on each operation
     try {
-      const server = await stoatClient.getServer(existingStoatServerId);
-      // Verify the bot owns this server (bot's user is the server owner)
-      const self = await stoatClient.getSelf();
-      if (server.owner !== self._id) {
-        await interaction.editReply({
-          embeds: [
-            new EmbedBuilder()
-              .setTitle("Permission Denied")
-              .setDescription(
-                `The bot does not own Stoat server \`${existingStoatServerId}\`. ` +
-                `Only servers created by this bot can be targeted for migration.`
-              )
-              .setColor(0xff0000),
-          ],
-        });
-        return;
-      }
-    } catch {
-      // getServer will fail if bot can't access — handled in the fetch block below
+      await stoatClient.getServer(existingStoatServerId);
+    } catch (err) {
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("Cannot Access Stoat Server")
+            .setDescription(
+              `The bot cannot access Stoat server \`${existingStoatServerId}\`. ` +
+              `Make sure the bot is a member of the server.\n\n` +
+              `Error: ${err}`
+            )
+            .setColor(0xff0000),
+        ],
+      });
+      return;
     }
 
     // 2. Check if this Stoat server is already linked to a DIFFERENT Discord guild
