@@ -42,8 +42,12 @@ export class Store {
       for (const stmt of MIGRATIONS_V2) {
         try {
           this.db.run(stmt);
-        } catch {
-          // Expected: "duplicate column name" if column already exists
+        } catch (err) {
+          // Only ignore "duplicate column" errors — rethrow anything else
+          if (!String(err).includes("duplicate column name")) {
+            console.error(`[db] Migration failed: ${stmt}`, err);
+            throw err;
+          }
         }
       }
     }
@@ -233,12 +237,16 @@ export class Store {
       return null;
     }
 
-    // Mark as used (atomic — only one caller can succeed)
-    this.db
+    // Mark as used (atomic — only one caller can succeed via WHERE used_by_guild IS NULL)
+    const result = this.db
       .query(
         "UPDATE claim_codes SET used_by_guild = ?, used_by_discord_user = ?, used_at = unixepoch() WHERE code = ? AND used_by_guild IS NULL"
       )
       .run(guildId, discordUserId, code);
+
+    // If no rows updated, another caller consumed it between our SELECT and UPDATE
+    if ((result as { changes: number }).changes === 0) return null;
+
     return row.stoat_server_id;
   }
 
@@ -396,12 +404,14 @@ export class Store {
   }
 }
 
-/** Generate a 6-char alphanumeric claim code (uppercase for readability) */
+/** Generate a 6-char alphanumeric claim code using crypto-secure randomness */
 function generateCode(): string {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I confusion
+  const randomBytes = new Uint8Array(6);
+  crypto.getRandomValues(randomBytes);
   let code = "";
   for (let i = 0; i < 6; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
+    code += chars[randomBytes[i]! % chars.length];
   }
   return code;
 }
