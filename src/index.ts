@@ -199,6 +199,73 @@ async function main(): Promise<void> {
           );
         }
 
+        // Route: POST /api/test-notify — send a test mention message to a Stoat channel
+        if (url.pathname === "/api/test-notify" && method === "POST") {
+          const body = (await req.json()) as {
+            channelId: string;
+            targetUserId: string;
+          };
+          if (!body.channelId || !body.targetUserId) {
+            return Response.json(
+              { error: "channelId and targetUserId are required" },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+          try {
+            const timestamp = new Date().toISOString();
+            const msg = await stoatClient.sendMessage(
+              body.channelId,
+              `**Notification Test (API)** — <@${body.targetUserId}> test ping at ${timestamp}`
+            );
+            return addHeaders(
+              Response.json({
+                ok: true,
+                messageId: msg._id,
+                info: "Message sent with mention. If push is working, target user should receive a notification.",
+              }),
+              corsHeaders
+            );
+          } catch (err) {
+            return Response.json(
+              { error: `Failed to send: ${err}` },
+              { status: 500, headers: corsHeaders }
+            );
+          }
+        }
+
+        // Route: GET /api/diag — bot diagnostics
+        if (url.pathname === "/api/diag" && method === "GET") {
+          try {
+            const self = await stoatClient.getSelf();
+            return addHeaders(
+              Response.json({
+                bot: {
+                  id: self._id,
+                  username: self.username,
+                  isBot: !!self.bot,
+                },
+                discord: {
+                  connected: discordClient.isReady(),
+                  guilds: discordClient.guilds.cache.size,
+                  user: discordClient.user?.tag ?? null,
+                },
+                stoat: {
+                  wsConnected: stoatWs.isConnected(),
+                },
+                links: {
+                  total: store.getAllActiveChannelLinks().length,
+                },
+              }),
+              corsHeaders
+            );
+          } catch (err) {
+            return Response.json(
+              { error: `Diagnostics failed: ${err}` },
+              { status: 500, headers: corsHeaders }
+            );
+          }
+        }
+
         // 404
         return Response.json({ error: "Not found" }, {
           status: 404,

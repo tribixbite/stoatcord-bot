@@ -43,6 +43,11 @@ export class StoatWebSocket {
     (this.handlers[event] as ((...args: any[]) => void)[]).push(handler);
   }
 
+  /** Check if WebSocket is currently connected */
+  isConnected(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+
   /** Connect to the Bonfire WebSocket */
   connect(): void {
     this.shouldReconnect = true;

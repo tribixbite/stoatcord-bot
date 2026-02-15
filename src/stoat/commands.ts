@@ -129,6 +129,12 @@ export function setupStoatCommands(
       case "status":
         await handleStatusCommand(event, serverId, stoatClient, store);
         break;
+      case "ping":
+        await handlePingCommand(event, parsed.args, stoatClient);
+        break;
+      case "diag":
+        await handleDiagCommand(event, serverId, stoatClient);
+        break;
       case "help":
         await handleHelpCommand(event, stoatClient);
         break;
@@ -306,6 +312,109 @@ async function handleStatusCommand(
   });
 }
 
+/**
+ * !stoatcord ping <user_id> — send a message that mentions the target user.
+ * Used to test if the Stoat server generates push notifications for mentions.
+ */
+async function handlePingCommand(
+  event: BonfireMessageEvent,
+  args: string[],
+  stoatClient: StoatClient
+): Promise<void> {
+  if (args.length === 0) {
+    await stoatClient.sendMessage(
+      event.channel,
+      `Usage: \`!stoatcord ping <user_id>\`\n\nSends a message mentioning the target user to test push notifications.\n` +
+      `You can find user IDs from the member list or profile.`,
+      { replies: [{ id: event._id, mention: false }] }
+    );
+    return;
+  }
+
+  const targetUserId = args[0]!;
+
+  // Validate the user ID looks reasonable (26 chars, alphanumeric)
+  if (!/^[A-Za-z0-9]{26}$/.test(targetUserId)) {
+    await stoatClient.sendMessage(
+      event.channel,
+      `Invalid user ID format: \`${targetUserId}\`. Stoat user IDs are 26 alphanumeric characters.`,
+      { replies: [{ id: event._id, mention: false }] }
+    );
+    return;
+  }
+
+  // Verify user exists
+  let displayName = targetUserId;
+  try {
+    const user = await stoatClient.fetchUser(targetUserId);
+    displayName = user.display_name ?? user.username ?? targetUserId;
+  } catch {
+    await stoatClient.sendMessage(
+      event.channel,
+      `Could not find user \`${targetUserId}\`. Verify the ID is correct.`,
+      { replies: [{ id: event._id, mention: false }] }
+    );
+    return;
+  }
+
+  // Send a message with a mention — this should trigger the server's push notification system
+  const timestamp = new Date().toISOString();
+  await stoatClient.sendMessage(
+    event.channel,
+    `**Notification Test** — <@${targetUserId}> this is a test ping sent at ${timestamp}. ` +
+    `If push notifications are working, ${displayName} should receive a notification on their device.`
+  );
+
+  console.log(`[stoat-cmd] Ping test sent to user ${targetUserId} (${displayName}) in channel ${event.channel}`);
+}
+
+/**
+ * !stoatcord diag — run notification diagnostics for this server.
+ * Shows bot self-ID, server info, channel count, and push subscription status.
+ */
+async function handleDiagCommand(
+  event: BonfireMessageEvent,
+  serverId: string,
+  stoatClient: StoatClient
+): Promise<void> {
+  let report = "**Notification Diagnostics**\n\n";
+
+  try {
+    // Bot self info
+    const self = await stoatClient.getSelf();
+    report += `Bot user: \`${self.username}\` (\`${self._id}\`)\n`;
+    report += `Bot type: ${self.bot ? "Bot account" : "User account (not a bot!)"}\n\n`;
+
+    // Server info
+    const server = await stoatClient.getServer(serverId);
+    report += `Server: **${server.name}** (\`${serverId}\`)\n`;
+    report += `Owner: \`${server.owner}\`\n`;
+    report += `Channels: ${server.channels?.length ?? 0}\n\n`;
+
+    // Try to fetch server members to check who has push
+    report += `**How push notifications work:**\n`;
+    report += `1. User's app calls \`POST /push/subscribe\` with FCM token\n`;
+    report += `2. Server stores the subscription\n`;
+    report += `3. When a message mentions a user, server sends FCM push\n`;
+    report += `4. Android HandlerService receives and displays notification\n\n`;
+
+    report += `**Possible failure points:**\n`;
+    report += `- App not registered for push (\`POST /push/subscribe\` failed)\n`;
+    report += `- Server doesn't have Firebase credentials configured\n`;
+    report += `- google-services.json project mismatch (app vs server)\n`;
+    report += `- Android notification permission not granted\n`;
+    report += `- Channel or server is muted in app settings\n\n`;
+
+    report += `**Test:** Use \`!stoatcord ping <user_id>\` to send a mention and check if notification arrives.`;
+  } catch (err) {
+    report += `Error running diagnostics: ${err}`;
+  }
+
+  await stoatClient.sendMessage(event.channel, report, {
+    replies: [{ id: event._id, mention: false }],
+  });
+}
+
 /** !stoatcord help — show available commands */
 async function handleHelpCommand(
   event: BonfireMessageEvent,
@@ -314,9 +423,13 @@ async function handleHelpCommand(
   await stoatClient.sendMessage(
     event.channel,
     `**Stoatcord Bot Commands**\n\n` +
+    `**Migration:**\n` +
     `\`!stoatcord code\` — Generate a one-time migration code (admin only)\n` +
     `\`!stoatcord request <discord_guild_id>\` — Send migration request to a Discord guild (admin only)\n` +
-    `\`!stoatcord status\` — Show bridge link status\n` +
+    `\`!stoatcord status\` — Show bridge link status\n\n` +
+    `**Diagnostics:**\n` +
+    `\`!stoatcord ping <user_id>\` — Send a mention to test push notifications\n` +
+    `\`!stoatcord diag\` — Run notification diagnostics\n` +
     `\`!stoatcord help\` — Show this message`,
     { replies: [{ id: event._id, mention: false }] }
   );
