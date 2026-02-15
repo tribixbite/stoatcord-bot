@@ -14,10 +14,28 @@ import type { StoatClient } from "../stoat/client.ts";
 import type { Server as StoatServer } from "../stoat/types.ts";
 import { mapDiscordChannels, groupByCategory } from "./channels.ts";
 import { mapDiscordRoles } from "./roles.ts";
-import { executeMigration, type MigrationProgress } from "./progress.ts";
+import {
+  executeMigration,
+  MigrationCancelledError,
+  type MigrationProgress,
+  type MigrationOptions,
+} from "./progress.ts";
 import { waitForApproval } from "./approval.ts";
+import { generateMigrationSnapshot, splitSnapshotIntoMessages } from "./snapshot.ts";
 
-export type MigrateMode = "missing" | "roles" | "categories" | "all";
+export type MigrateMode = "missing" | "full" | "roles" | "categories";
+
+/** Options extracted from the slash command */
+export interface MigrateCommandOptions {
+  mode: MigrateMode;
+  claimCode?: string;
+  stoatServerId?: string;
+  dryRun: boolean;
+  includeSnapshot: boolean;
+  excludeMembers: boolean;
+  excludePins: boolean;
+  includeMedia: boolean;
+}
 
 /** Auth method resolved during authorization checks */
 type AuthResult =
@@ -40,9 +58,7 @@ export async function startMigrationWizard(
   guild: Guild,
   store: Store,
   stoatClient: StoatClient,
-  existingStoatServerId?: string,
-  mode: MigrateMode = "missing",
-  claimCode?: string,
+  options: MigrateCommandOptions,
   discordUserId?: string,
   discordUserName?: string
 ): Promise<void> {
@@ -50,6 +66,16 @@ export async function startMigrationWizard(
 
   const userId = discordUserId ?? interaction.user.id;
   const userName = discordUserName ?? interaction.user.tag;
+  const {
+    mode,
+    claimCode,
+    stoatServerId: existingStoatServerId,
+    dryRun,
+    includeSnapshot,
+    excludeMembers,
+    excludePins,
+    includeMedia,
+  } = options;
 
   // --- Authorization: resolve which path we're taking ---
   let auth: AuthResult;
@@ -352,13 +378,19 @@ export async function startMigrationWizard(
   }
 
   // Apply mode filter — mark items as selected/deselected based on mode and existing state
+  // "full" mode: select ALL items (create new + update existing)
+  // "missing" mode: select only items that don't exist yet (but executeMigration will still update matched ones)
   for (const ch of allChannels) {
     const alreadyExists = existingChannelNames.has(ch.stoatName.toLowerCase());
 
     switch (mode) {
       case "missing":
-        // Only create channels that don't already exist
-        ch.selected = !alreadyExists;
+        // Create missing + update existing (executeMigration handles both via name matching)
+        ch.selected = true;
+        break;
+      case "full":
+        // Create missing + update existing — same as missing but explicitly "full"
+        ch.selected = true;
         break;
       case "roles":
         // Don't create any channels in roles-only mode
@@ -368,10 +400,6 @@ export async function startMigrationWizard(
         // Don't create channels, just organize existing ones
         ch.selected = false;
         break;
-      case "all":
-        // Create everything (user was warned about duplicates)
-        ch.selected = true;
-        break;
     }
   }
 
@@ -380,32 +408,39 @@ export async function startMigrationWizard(
 
     switch (mode) {
       case "missing":
-        role.selected = !alreadyExists;
+        // Select all — executeMigration will create new and update existing
+        role.selected = true;
+        break;
+      case "full":
+        role.selected = true;
         break;
       case "roles":
-        // Create roles that don't exist yet
-        role.selected = !alreadyExists;
+        // Select all roles in roles-only mode
+        role.selected = true;
         break;
       case "categories":
         role.selected = false;
-        break;
-      case "all":
-        role.selected = true;
         break;
     }
   }
 
   const selectedChannels = allChannels.filter((c) => c.selected);
   const selectedRoles = allRoles.filter((r) => r.selected);
+
+  // Count what will be created vs updated for preview
+  const newChannels = selectedChannels.filter((c) => !existingChannelNames.has(c.stoatName.toLowerCase()));
+  const updateChannels = selectedChannels.filter((c) => existingChannelNames.has(c.stoatName.toLowerCase()));
+  const newRoles = selectedRoles.filter((r) => !existingRoleNames.has(r.stoatName.toLowerCase()));
+  const updateRoles = selectedRoles.filter((r) => existingRoleNames.has(r.stoatName.toLowerCase()));
   const skippedChannels = allChannels.filter((c) => !c.selected);
   const skippedRoles = allRoles.filter((r) => !r.selected);
 
   // Build preview embed
   const modeLabel: Record<MigrateMode, string> = {
-    missing: "Missing only (skip existing)",
+    missing: "Create missing + update existing",
+    full: "Full sync (create + update all)",
     roles: "Roles only",
     categories: "Categories only",
-    all: "Everything (may duplicate!)",
   };
 
   const previewEmbed = new EmbedBuilder()
@@ -416,10 +451,13 @@ export async function startMigrationWizard(
         `**Auth**: ${auth.method.replace("_", " ")}\n` +
         (effectiveStoatServerId
           ? `**Target**: Existing Stoat server \`${effectiveStoatServerId}\``
-          : "**Target**: New Stoat server (will be created)")
+          : "**Target**: New Stoat server (will be created)") +
+        (dryRun ? "\n**Dry run**: Yes (no changes will be made)" : "") +
+        (includeSnapshot ? "\n**Snapshot**: Will post to #migration-log" : "") +
+        (includeMedia ? "\n**Media**: Will upload icon/banner/emoji" : "")
     );
 
-  // Show what will be created
+  // Show what will be created/updated
   if (mode === "categories") {
     // Categories-only mode: show category organization plan
     const categoryGroups = groupByCategory(allChannels);
@@ -436,19 +474,40 @@ export async function startMigrationWizard(
     });
   } else {
     // Channels to create
-    if (selectedChannels.length > 0) {
-      const categoryGroups = groupByCategory(selectedChannels);
+    if (newChannels.length > 0) {
+      const categoryGroups = groupByCategory(newChannels);
       let channelList = "";
       for (const [category, channels] of categoryGroups) {
         channelList += `**${category ?? "No Category"}**\n`;
         for (const ch of channels) {
           const icon = ch.stoatType === "Voice" ? "🔊" : "#";
-          channelList += `  ${icon} ${ch.stoatName}\n`;
+          const props: string[] = [];
+          if (ch.topic) props.push("topic");
+          if (ch.nsfw) props.push("nsfw");
+          channelList += `  ${icon} ${ch.stoatName}${props.length > 0 ? ` (${props.join(", ")})` : ""}\n`;
         }
       }
       previewEmbed.addFields({
-        name: `Channels to create (${selectedChannels.length})`,
+        name: `Channels to create (${newChannels.length})`,
         value: channelList.slice(0, 1024) || "None",
+      });
+    }
+
+    // Channels to update
+    if (updateChannels.length > 0) {
+      previewEmbed.addFields({
+        name: `Channels to update (${updateChannels.length})`,
+        value: updateChannels
+          .slice(0, 15)
+          .map((c) => {
+            const props: string[] = [];
+            if (c.topic) props.push("description");
+            if (c.nsfw) props.push("nsfw");
+            return `• ${c.stoatName}${props.length > 0 ? ` (${props.join(", ")})` : ""}`;
+          })
+          .join("\n")
+          .slice(0, 1024) +
+          (updateChannels.length > 15 ? `\n+${updateChannels.length - 15} more` : ""),
       });
     }
 
@@ -458,7 +517,7 @@ export async function startMigrationWizard(
         name: `Channels skipped (${skippedChannels.length})`,
         value: skippedChannels
           .slice(0, 15)
-          .map((c) => `~~${c.stoatName}~~ (exists)`)
+          .map((c) => `~~${c.stoatName}~~`)
           .join(", ")
           .slice(0, 1024) +
           (skippedChannels.length > 15 ? ` +${skippedChannels.length - 15} more` : ""),
@@ -466,16 +525,31 @@ export async function startMigrationWizard(
     }
 
     // Roles to create
-    if (selectedRoles.length > 0) {
-      const roleList = selectedRoles
+    if (newRoles.length > 0) {
+      const roleList = newRoles
         .map((r) => {
-          const color = r.stoatColor ? ` (${r.stoatColor})` : "";
-          return `• ${r.stoatName}${color}`;
+          const props: string[] = [];
+          if (r.stoatColor) props.push(r.stoatColor);
+          if (r.hoist) props.push("hoisted");
+          return `• ${r.stoatName}${props.length > 0 ? ` (${props.join(", ")})` : ""}`;
         })
         .join("\n");
       previewEmbed.addFields({
-        name: `Roles to create (${selectedRoles.length})`,
+        name: `Roles to create (${newRoles.length})`,
         value: roleList.slice(0, 1024) || "None",
+      });
+    }
+
+    // Roles to update
+    if (updateRoles.length > 0) {
+      previewEmbed.addFields({
+        name: `Roles to update (${updateRoles.length})`,
+        value: updateRoles
+          .slice(0, 15)
+          .map((r) => `• ${r.stoatName}`)
+          .join("\n")
+          .slice(0, 1024) +
+          (updateRoles.length > 15 ? `\n+${updateRoles.length - 15} more` : ""),
       });
     }
 
@@ -485,7 +559,7 @@ export async function startMigrationWizard(
         name: `Roles skipped (${skippedRoles.length})`,
         value: skippedRoles
           .slice(0, 15)
-          .map((r) => `~~${r.stoatName}~~ (exists)`)
+          .map((r) => `~~${r.stoatName}~~`)
           .join(", ")
           .slice(0, 1024) +
           (skippedRoles.length > 15 ? ` +${skippedRoles.length - 15} more` : ""),
@@ -495,12 +569,12 @@ export async function startMigrationWizard(
 
   // Nothing to do?
   const totalOps = selectedChannels.length + selectedRoles.length + (mode === "categories" ? 1 : 0);
-  if (totalOps === 0 && mode !== "categories") {
+  if (totalOps === 0 && mode !== "categories" && !includeSnapshot) {
     previewEmbed
       .setColor(0x00cc00)
       .setDescription(
         previewEmbed.data.description +
-          "\n\n**Everything is already migrated.** Nothing new to create."
+          "\n\n**Everything is already migrated.** Nothing new to create or update."
       );
     await interaction.editReply({ embeds: [previewEmbed] });
     return;
@@ -512,17 +586,31 @@ export async function startMigrationWizard(
     text: `${totalOps} operation(s) | ~${estimatedSeconds}s estimated`,
   });
 
-  // Confirm buttons
+  // Confirm buttons — Start, Dry Run, Cancel
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId("migrate_start")
       .setLabel(mode === "categories" ? "Organize Categories" : "Start Migration")
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
+      .setCustomId("migrate_dryrun")
+      .setLabel("Dry Run")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
       .setCustomId("migrate_cancel")
       .setLabel("Cancel")
       .setStyle(ButtonStyle.Secondary)
   );
+
+  // If dryRun was set via slash command option, skip button selection
+  if (dryRun) {
+    await runMigration(
+      interaction, guild, store, stoatClient, auth,
+      allChannels, allRoles, mode, existingServer, userId,
+      true, includeSnapshot, excludeMembers, excludePins, includeMedia
+    );
+    return;
+  }
 
   const response = await interaction.editReply({
     embeds: [previewEmbed],
@@ -549,126 +637,24 @@ export async function startMigrationWizard(
       return;
     }
 
-    // Start migration
+    const isDryRun = buttonInteraction.customId === "migrate_dryrun";
+
+    // Acknowledge button click
     await buttonInteraction.update({
       embeds: [
         new EmbedBuilder()
-          .setTitle("Migration in Progress...")
+          .setTitle(isDryRun ? "Dry Run in Progress..." : "Migration in Progress...")
           .setDescription("Starting...")
-          .setColor(0xffaa00),
+          .setColor(isDryRun ? 0x5865f2 : 0xffaa00),
       ],
       components: [],
     });
 
-    // Create or use Stoat server based on auth path
-    let stoatServerId = auth.stoatServerId;
-    if (!stoatServerId) {
-      const created = await stoatClient.createServer(guild.name);
-      stoatServerId = created.server._id;
-    }
-    store.linkServer(guild.id, stoatServerId, auth.method, userId, auth.stoatUserId ?? undefined);
-
-    if (mode === "categories") {
-      // Categories-only: just organize existing channels
-      await handleCategoriesOnly(
-        interaction,
-        stoatClient,
-        store,
-        guild,
-        stoatServerId,
-        allChannels,
-        existingServer,
-        userId,
-        auth.stoatUserId ?? undefined
-      );
-      return;
-    }
-
-    // Execute migration with progress updates
-    const result = await executeMigration(
-      stoatClient,
-      store,
-      guild.id,
-      stoatServerId,
-      allChannels, // executeMigration respects the `selected` flag
-      allRoles,
-      userId,
-      auth.stoatUserId ?? undefined,
-      async (progress: MigrationProgress) => {
-        if (
-          progress.completedSteps % 3 === 0 ||
-          progress.completedSteps === progress.totalSteps
-        ) {
-          const pct = Math.round(
-            (progress.completedSteps / progress.totalSteps) * 100
-          );
-          const progressBar = buildProgressBar(pct);
-
-          try {
-            await interaction.editReply({
-              embeds: [
-                new EmbedBuilder()
-                  .setTitle("Migration in Progress...")
-                  .setDescription(
-                    `${progressBar} ${pct}%\n\n${progress.currentAction}`
-                  )
-                  .setColor(0xffaa00)
-                  .addFields({
-                    name: "Progress",
-                    value: `${progress.completedSteps}/${progress.totalSteps} operations`,
-                  }),
-              ],
-            });
-          } catch {
-            // Ignore edit failures (rate limited)
-          }
-        }
-      }
+    await runMigration(
+      interaction, guild, store, stoatClient, auth,
+      allChannels, allRoles, mode, existingServer, userId,
+      isDryRun, includeSnapshot, excludeMembers, excludePins, includeMedia
     );
-
-    // Final results embed
-    const successCount = result.totalSteps - result.errors.length - 1; // -1 for categories step
-    const resultEmbed = new EmbedBuilder()
-      .setTitle("Migration Complete")
-      .setColor(result.errors.length > 0 ? 0xffaa00 : 0x00cc00)
-      .addFields(
-        {
-          name: "Stoat Server",
-          value: `\`${stoatServerId}\``,
-          inline: true,
-        },
-        {
-          name: "Created",
-          value: `${successCount} items`,
-          inline: true,
-        },
-        {
-          name: "Skipped",
-          value: `${skippedChannels.length + skippedRoles.length} (already exist)`,
-          inline: true,
-        },
-        {
-          name: "Errors",
-          value: `${result.errors.length}`,
-          inline: true,
-        }
-      );
-
-    if (result.errors.length > 0) {
-      const errorList = result.errors
-        .slice(0, 10)
-        .map((e) => `• ${e.action}: ${e.error}`)
-        .join("\n");
-      resultEmbed.addFields({
-        name: "Error Details",
-        value: errorList.slice(0, 1024),
-      });
-    }
-
-    await interaction.editReply({
-      embeds: [resultEmbed],
-      components: [],
-    });
   } catch {
     // Timeout — no button was clicked
     await interaction.editReply({
@@ -681,6 +667,340 @@ export async function startMigrationWizard(
       components: [],
     });
   }
+}
+
+/**
+ * Execute the migration (or dry run) with progress tracking and cancel support.
+ * Extracted from the main wizard to handle both button-triggered and option-triggered runs.
+ */
+async function runMigration(
+  interaction: ChatInputCommandInteraction,
+  guild: Guild,
+  store: Store,
+  stoatClient: StoatClient,
+  auth: AuthResult,
+  allChannels: ReturnType<typeof mapDiscordChannels>,
+  allRoles: ReturnType<typeof mapDiscordRoles>,
+  mode: MigrateMode,
+  existingServer: StoatServer | null,
+  userId: string,
+  isDryRun: boolean,
+  includeSnapshot: boolean,
+  excludeMembers: boolean,
+  excludePins: boolean,
+  includeMedia: boolean
+): Promise<void> {
+  // Create or use Stoat server based on auth path
+  let stoatServerId = auth.stoatServerId;
+  if (!stoatServerId) {
+    if (isDryRun) {
+      // Can't dry-run server creation — would need a real server ID
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("Dry Run — New Server")
+            .setDescription(
+              "Dry run completed. A new Stoat server would be created and all channels/roles would be migrated.\n" +
+              "Use **Start Migration** to actually create the server."
+            )
+            .setColor(0x5865f2),
+        ],
+      });
+      return;
+    }
+    const created = await stoatClient.createServer(guild.name, guild.description ?? undefined);
+    stoatServerId = created.server._id;
+  }
+  store.linkServer(guild.id, stoatServerId, auth.method, userId, auth.stoatUserId ?? undefined);
+
+  if (mode === "categories" && !isDryRun) {
+    // Categories-only: just organize existing channels
+    await handleCategoriesOnly(
+      interaction, stoatClient, store, guild, stoatServerId,
+      allChannels, existingServer, userId, auth.stoatUserId ?? undefined
+    );
+    return;
+  }
+
+  // Set up AbortController for mid-flight cancellation
+  const abortController = new AbortController();
+
+  // Build migration options
+  const migrationOptions: MigrationOptions = {
+    dryRun: isDryRun,
+    signal: abortController.signal,
+    includeEmoji: includeMedia,
+    includeMedia,
+    guild,
+  };
+
+  // Show cancel button during execution (only for live runs)
+  if (!isDryRun) {
+    const cancelRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("migrate_abort")
+        .setLabel("Cancel Migration")
+        .setStyle(ButtonStyle.Danger)
+    );
+
+    // Listen for cancel button in background
+    const message = await interaction.fetchReply();
+    const cancelCollector = message.createMessageComponentCollector({
+      componentType: ComponentType.Button,
+      filter: (i) => i.user.id === interaction.user.id && i.customId === "migrate_abort",
+      time: 600_000, // 10 minutes
+      max: 1,
+    });
+
+    cancelCollector.on("collect", async (i) => {
+      abortController.abort();
+      try {
+        await i.update({
+          embeds: [
+            new EmbedBuilder()
+              .setTitle("Cancelling Migration...")
+              .setDescription("Waiting for current operation to finish...")
+              .setColor(0xff6600),
+          ],
+          components: [],
+        });
+      } catch {
+        // Ignore if interaction already replied
+      }
+    });
+
+    // Update embed with cancel button
+    try {
+      await interaction.editReply({ components: [cancelRow] });
+    } catch {
+      // Ignore
+    }
+  }
+
+  // Execute migration with progress updates
+  let result: MigrationProgress;
+  try {
+    result = await executeMigration(
+      stoatClient, store, guild.id, stoatServerId,
+      allChannels, allRoles, userId, auth.stoatUserId ?? undefined,
+      async (progress: MigrationProgress) => {
+        if (
+          progress.completedSteps % 3 === 0 ||
+          progress.completedSteps === progress.totalSteps
+        ) {
+          const pct = Math.round(
+            (progress.completedSteps / progress.totalSteps) * 100
+          );
+          const progressBar = buildProgressBar(pct);
+          const title = isDryRun ? "Dry Run in Progress..." : "Migration in Progress...";
+
+          try {
+            await interaction.editReply({
+              embeds: [
+                new EmbedBuilder()
+                  .setTitle(title)
+                  .setDescription(
+                    `${progressBar} ${pct}%\n\n${progress.currentAction}`
+                  )
+                  .setColor(isDryRun ? 0x5865f2 : 0xffaa00)
+                  .addFields({
+                    name: "Progress",
+                    value: `${progress.completedSteps}/${progress.totalSteps} operations`,
+                  }),
+              ],
+            });
+          } catch {
+            // Ignore edit failures (rate limited)
+          }
+        }
+      },
+      migrationOptions
+    );
+  } catch (err) {
+    if (err instanceof MigrationCancelledError) {
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("Migration Cancelled")
+            .setDescription(
+              "Migration was cancelled. Partial progress has been preserved.\n" +
+              "You can run `/migrate` again to continue where you left off."
+            )
+            .setColor(0xff6600),
+        ],
+        components: [],
+      });
+      return;
+    }
+    throw err;
+  }
+
+  // --- Build results embed ---
+  if (isDryRun) {
+    // Dry run results
+    const dryRunEmbed = new EmbedBuilder()
+      .setTitle("Dry Run Complete")
+      .setColor(0x5865f2)
+      .addFields(
+        { name: "Would Create", value: `${result.created}`, inline: true },
+        { name: "Would Update", value: `${result.updated}`, inline: true },
+        { name: "Warnings", value: `${result.warnings.length}`, inline: true },
+      );
+
+    // Show planned actions
+    if (result.dryRunLog.length > 0) {
+      const logText = result.dryRunLog
+        .slice(0, 25)
+        .map((l) => `• ${l}`)
+        .join("\n");
+      dryRunEmbed.addFields({
+        name: "Planned Actions",
+        value: (logText + (result.dryRunLog.length > 25 ? `\n+${result.dryRunLog.length - 25} more` : "")).slice(0, 1024),
+      });
+    }
+
+    if (result.warnings.length > 0) {
+      const warnText = result.warnings
+        .slice(0, 10)
+        .map((w) => `⚠ ${w}`)
+        .join("\n");
+      dryRunEmbed.addFields({
+        name: "Warnings",
+        value: (warnText + (result.warnings.length > 10 ? `\n+${result.warnings.length - 10} more` : "")).slice(0, 1024),
+      });
+    }
+
+    await interaction.editReply({
+      embeds: [dryRunEmbed],
+      components: [],
+    });
+    return;
+  }
+
+  // Live results
+  const resultEmbed = new EmbedBuilder()
+    .setTitle("Migration Complete")
+    .setColor(result.errors.length > 0 ? 0xffaa00 : 0x00cc00)
+    .addFields(
+      { name: "Stoat Server", value: `\`${stoatServerId}\``, inline: true },
+      { name: "Created", value: `${result.created}`, inline: true },
+      { name: "Updated", value: `${result.updated}`, inline: true },
+      { name: "Errors", value: `${result.errors.length}`, inline: true },
+    );
+
+  if (result.errors.length > 0) {
+    const errorList = result.errors
+      .slice(0, 10)
+      .map((e) => `• ${e.action}: ${e.error}`)
+      .join("\n");
+    resultEmbed.addFields({
+      name: "Error Details",
+      value: errorList.slice(0, 1024),
+    });
+  }
+
+  if (result.warnings.length > 0) {
+    const warnText = result.warnings
+      .slice(0, 5)
+      .map((w) => `⚠ ${w}`)
+      .join("\n");
+    resultEmbed.addFields({
+      name: "Warnings",
+      value: (warnText + (result.warnings.length > 5 ? `\n+${result.warnings.length - 5} more` : "")).slice(0, 1024),
+    });
+  }
+
+  await interaction.editReply({
+    embeds: [resultEmbed],
+    components: [],
+  });
+
+  // --- Post-migration: snapshot to #migration-log ---
+  if (includeSnapshot && stoatServerId) {
+    try {
+      await postMigrationSnapshot(
+        stoatClient, store, guild, stoatServerId,
+        !excludeMembers, !excludePins, includeMedia
+      );
+    } catch (err) {
+      console.error("[migrate] Snapshot posting failed:", err);
+      // Non-fatal — migration itself succeeded
+    }
+  }
+}
+
+/**
+ * Generate and post a full data snapshot to #migration-log in the Stoat server.
+ * Creates the channel if it doesn't exist, with restricted default permissions.
+ */
+async function postMigrationSnapshot(
+  stoatClient: StoatClient,
+  store: Store,
+  guild: Guild,
+  stoatServerId: string,
+  includeMembers: boolean,
+  includePins: boolean,
+  includeMedia: boolean
+): Promise<void> {
+  // Find or create #migration-log channel
+  const server = await stoatClient.getServer(stoatServerId);
+  let logChannelId: string | null = null;
+
+  for (const chId of server.channels) {
+    try {
+      const ch = await stoatClient.getChannel(chId);
+      if (ch.name?.toLowerCase() === "migration-log") {
+        logChannelId = ch._id;
+        break;
+      }
+    } catch {
+      // Skip inaccessible
+    }
+  }
+
+  if (!logChannelId) {
+    // Create the channel
+    const logChannel = await stoatClient.createChannel(stoatServerId, {
+      type: "Text",
+      name: "migration-log",
+      description: "Discord migration data snapshot — restricted access",
+    });
+    logChannelId = logChannel._id;
+
+    // Restrict default permissions: deny ViewChannel for @everyone
+    // Stoat uses the channel's default_permissions to override the server default
+    try {
+      await stoatClient.setChannelDefaultPermissions(logChannelId, {
+        a: 0,
+        d: Number(1n << 20n), // Deny ViewChannel
+      });
+    } catch (err) {
+      console.warn("[migrate] Could not restrict #migration-log permissions:", err);
+    }
+  }
+
+  // Generate snapshot
+  const snapshot = await generateMigrationSnapshot(guild, stoatClient, {
+    includeMembers,
+    includePins,
+    includeMedia,
+  });
+
+  // Split into messages
+  const messages = splitSnapshotIntoMessages(snapshot);
+
+  // Post each message to #migration-log
+  for (let i = 0; i < messages.length; i++) {
+    const prefix = messages.length > 1 ? `**[${i + 1}/${messages.length}]**\n` : "";
+    await stoatClient.sendMessage(logChannelId!, prefix + messages[i]!.content);
+
+    // Rate limit: don't spam the channel
+    if (i < messages.length - 1) {
+      await (await import("../util.ts")).sleep(1500);
+    }
+  }
+
+  console.log(`[migrate] Posted ${messages.length} snapshot message(s) to #migration-log`);
 }
 
 /**
@@ -778,14 +1098,8 @@ async function handleCategoriesOnly(
     });
   } catch (err) {
     store.logMigration(
-      guild.id,
-      "categories_set",
-      null,
-      stoatServerId,
-      "error",
-      String(err),
-      discordUserId,
-      stoatUserId
+      guild.id, "categories_set", null, stoatServerId, "error",
+      String(err), discordUserId, stoatUserId
     );
     await interaction.editReply({
       embeds: [

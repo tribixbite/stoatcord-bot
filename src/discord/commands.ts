@@ -34,14 +34,44 @@ export const commands: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
     .addStringOption((opt) =>
       opt
         .setName("mode")
-        .setDescription("What to migrate (default: missing — skip existing)")
+        .setDescription("What to migrate (default: missing — create new + update existing)")
         .setRequired(false)
         .addChoices(
-          { name: "Missing only (skip existing channels/roles)", value: "missing" },
+          { name: "Create missing + update existing (default)", value: "missing" },
+          { name: "Full sync (create + update everything)", value: "full" },
           { name: "Roles only", value: "roles" },
           { name: "Categories only (organize existing channels)", value: "categories" },
-          { name: "Everything (creates duplicates!)", value: "all" }
         )
+    )
+    .addBooleanOption((opt) =>
+      opt
+        .setName("dry_run")
+        .setDescription("Preview what would happen without making changes")
+        .setRequired(false)
+    )
+    .addBooleanOption((opt) =>
+      opt
+        .setName("include_snapshot")
+        .setDescription("Post full Discord server data snapshot to #migration-log")
+        .setRequired(false)
+    )
+    .addBooleanOption((opt) =>
+      opt
+        .setName("exclude_members")
+        .setDescription("Exclude member/ban lists from snapshot (default: true)")
+        .setRequired(false)
+    )
+    .addBooleanOption((opt) =>
+      opt
+        .setName("exclude_pins")
+        .setDescription("Exclude pinned messages from snapshot")
+        .setRequired(false)
+    )
+    .addBooleanOption((opt) =>
+      opt
+        .setName("include_media")
+        .setDescription("Upload server media (icon, banner, emoji images)")
+        .setRequired(false)
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .toJSON(),

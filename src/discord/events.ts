@@ -10,7 +10,7 @@ import {
 } from "discord.js";
 import type { Store } from "../db/store.ts";
 import type { StoatClient } from "../stoat/client.ts";
-import { startMigrationWizard } from "../migration/wizard.ts";
+import { startMigrationWizard, type MigrateMode, type MigrateCommandOptions } from "../migration/wizard.ts";
 import { relayDiscordToStoat } from "../bridge/relay.ts";
 import { ensureWebhook } from "../bridge/webhooks.ts";
 
@@ -102,16 +102,21 @@ async function handleMigrate(
     return;
   }
 
-  const claimCode =
-    interaction.options.getString("claim_code") ?? undefined;
-  const stoatServerId =
-    interaction.options.getString("stoat_server_id") ?? undefined;
-  const mode =
-    (interaction.options.getString("mode") as "missing" | "roles" | "categories" | "all" | null) ?? "missing";
+  // Extract all options
+  const options: MigrateCommandOptions = {
+    claimCode: interaction.options.getString("claim_code") ?? undefined,
+    stoatServerId: interaction.options.getString("stoat_server_id") ?? undefined,
+    mode: (interaction.options.getString("mode") as MigrateMode | null) ?? "missing",
+    dryRun: interaction.options.getBoolean("dry_run") ?? false,
+    includeSnapshot: interaction.options.getBoolean("include_snapshot") ?? false,
+    excludeMembers: interaction.options.getBoolean("exclude_members") ?? true,
+    excludePins: interaction.options.getBoolean("exclude_pins") ?? false,
+    includeMedia: interaction.options.getBoolean("include_media") ?? false,
+  };
 
   await startMigrationWizard(
     interaction, guild, store, stoatClient,
-    stoatServerId, mode, claimCode,
+    options,
     interaction.user.id, interaction.user.tag
   );
 }
