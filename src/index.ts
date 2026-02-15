@@ -30,7 +30,7 @@ async function main(): Promise<void> {
   console.log("[db] Database initialized");
 
   // Initialize Stoat REST client
-  const stoatClient = new StoatClient(config.stoatToken, config.stoatApiBase);
+  const stoatClient = new StoatClient(config.stoatToken, config.stoatApiBase, config.stoatAutumnUrl);
 
   // Verify Stoat bot token and store bot user ID for command detection
   let botSelfId: string;

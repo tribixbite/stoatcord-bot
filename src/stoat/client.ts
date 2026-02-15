@@ -18,6 +18,10 @@ import type {
   MessageQuery,
   BulkMessagesResponse,
   PermissionsPair,
+  BanInfo,
+  MemberListResponse,
+  EmojiInfo,
+  AutumnUploadResponse,
 } from "./types.ts";
 
 interface RateLimitState {
@@ -29,11 +33,13 @@ interface RateLimitState {
 export class StoatClient {
   private token: string;
   private baseUrl: string;
+  private autumnUrl: string;
   private rateLimits = new Map<string, RateLimitState>();
 
-  constructor(token: string, baseUrl: string) {
+  constructor(token: string, baseUrl: string, autumnUrl?: string) {
     this.token = token;
     this.baseUrl = baseUrl.replace(/\/$/, ""); // strip trailing slash
+    this.autumnUrl = (autumnUrl ?? "https://autumn.stoat.chat").replace(/\/$/, "");
   }
 
   // --- Auth ---
@@ -171,6 +177,113 @@ export class StoatClient {
       "PUT",
       `/servers/${serverId}/permissions/default`,
       { permissions }
+    );
+  }
+
+  // --- Bans ---
+
+  async fetchBans(serverId: string): Promise<BanInfo[]> {
+    return this.request<BanInfo[]>("GET", `/servers/${serverId}/bans`);
+  }
+
+  // --- Members ---
+
+  async fetchMembers(serverId: string): Promise<MemberListResponse> {
+    return this.request<MemberListResponse>(
+      "GET",
+      `/servers/${serverId}/members`
+    );
+  }
+
+  // --- Emoji ---
+
+  async listEmoji(serverId: string): Promise<EmojiInfo[]> {
+    // Fetch all server emoji — Revolt returns them from the server object's emojis
+    return this.request<EmojiInfo[]>(
+      "GET",
+      `/servers/${serverId}/emojis`
+    );
+  }
+
+  async createEmoji(
+    name: string,
+    parentServerId: string,
+    autumnId: string
+  ): Promise<EmojiInfo> {
+    return this.request<EmojiInfo>(
+      "PUT",
+      `/custom/emoji/${autumnId}`,
+      { name, parent: { type: "Server", id: parentServerId } }
+    );
+  }
+
+  // --- File uploads (Autumn CDN) ---
+
+  /**
+   * Upload a file to the Autumn CDN.
+   * @param tag - Autumn tag: "attachments", "icons", "banners", "emojis", "avatars"
+   * @param fileBuffer - Raw file data
+   * @param filename - Filename with extension
+   * @returns The Autumn file ID for use in API calls
+   */
+  async uploadFile(
+    tag: string,
+    fileBuffer: Buffer | Uint8Array,
+    filename: string
+  ): Promise<AutumnUploadResponse> {
+    const formData = new FormData();
+    const blob = new Blob([fileBuffer]);
+    formData.append("file", blob, filename);
+
+    const url = `${this.autumnUrl}/${tag}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "x-bot-token": this.token,
+      },
+      body: formData,
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(
+        `Autumn upload error: POST ${tag} → ${res.status} ${res.statusText}: ${text}`
+      );
+    }
+
+    return (await res.json()) as AutumnUploadResponse;
+  }
+
+  // --- Channel permissions ---
+
+  /**
+   * Set role-specific permission overrides on a channel.
+   * PUT /channels/{channel_id}/permissions/{role_id}
+   */
+  async setChannelRolePermissions(
+    channelId: string,
+    roleId: string,
+    perms: PermissionsPair
+  ): Promise<void> {
+    await this.request<unknown>(
+      "PUT",
+      `/channels/${channelId}/permissions/${roleId}`,
+      { permissions: perms }
+    );
+  }
+
+  /**
+   * Set default permission overrides on a channel.
+   * PUT /channels/{channel_id}/permissions/default
+   */
+  async setChannelDefaultPermissions(
+    channelId: string,
+    perms: PermissionsPair
+  ): Promise<void> {
+    await this.request<unknown>(
+      "PUT",
+      `/channels/${channelId}/permissions/default`,
+      { permissions: perms }
     );
   }
 

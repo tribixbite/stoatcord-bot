@@ -14,6 +14,16 @@ export interface RoleMapping {
   stoatColor: string | null;
   permissions: PermissionsPair;
   selected: boolean;
+  /** Whether role is displayed separately in the member list */
+  hoist: boolean;
+  /** Whether role can be @mentioned */
+  mentionable: boolean;
+  /** Discord role icon URL (if custom icon set) */
+  iconUrl: string | null;
+  /** Unicode emoji used as role icon (Discord feature) */
+  unicodeEmoji: string | null;
+  /** Warnings generated during mapping (truncation, unsupported features, etc.) */
+  warnings: string[];
 }
 
 /**
@@ -28,13 +38,34 @@ export function mapDiscordRoles(guild: Guild): RoleMapping[] {
     .sort((a, b) => b.position - a.position); // highest position first
 
   for (const role of roles) {
+    const warnings: string[] = [];
+    const trimmedName = role.name.trim();
+    const stoatName = trimmedName.slice(0, 32);
+    if (trimmedName.length > 32) {
+      warnings.push(`Name truncated: '${trimmedName}' → '${stoatName}'`);
+    }
+    if (role.mentionable) {
+      warnings.push("Mentionable flag not supported by Stoat");
+    }
+    if (role.iconURL()) {
+      warnings.push("Role icon not directly supported by Stoat");
+    }
+    if (role.unicodeEmoji) {
+      warnings.push(`Unicode emoji '${role.unicodeEmoji}' not supported by Stoat`);
+    }
+
     mappings.push({
       discordRole: role,
       discordId: role.id,
-      stoatName: role.name.slice(0, 32),
+      stoatName,
       stoatColor: role.hexColor !== "#000000" ? role.hexColor : null,
       permissions: mapPermissions(role.permissions),
       selected: true,
+      hoist: role.hoist,
+      mentionable: role.mentionable,
+      iconUrl: role.iconURL({ size: 256 }) ?? null,
+      unicodeEmoji: role.unicodeEmoji ?? null,
+      warnings,
     });
   }
 

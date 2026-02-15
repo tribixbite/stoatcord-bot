@@ -1,6 +1,11 @@
 /** Discord → Stoat channel structure mapping */
 
-import { ChannelType, type Guild, type GuildChannel } from "discord.js";
+import {
+  ChannelType,
+  type Guild,
+  type GuildChannel,
+  type TextChannel,
+} from "discord.js";
 
 export interface ChannelMapping {
   discordChannel: GuildChannel;
@@ -10,6 +15,18 @@ export interface ChannelMapping {
   category: string | null; // category name
   position: number;
   selected: boolean;
+  /** Channel topic/description (from TextChannel) */
+  topic: string | null;
+  /** Whether channel is marked NSFW */
+  nsfw: boolean;
+  /** Slowmode in seconds (Discord rateLimitPerUser) */
+  slowmodeSeconds: number;
+  /** Original Discord channel type name for snapshot reference */
+  originalType: string;
+  /** Number of permission overwrites on the Discord channel */
+  permOverwriteCount: number;
+  /** Warnings generated during mapping (truncation, unsupported features, etc.) */
+  warnings: string[];
 }
 
 /**
@@ -40,14 +57,44 @@ export function mapDiscordChannels(guild: Guild): ChannelMapping[] {
     const stoatType = mapChannelType(ch.type);
     if (!stoatType) continue;
 
+    const warnings: string[] = [];
+    const sanitized = sanitizeName(ch.name);
+    if (ch.name.length > 32) {
+      warnings.push(`Name truncated: '${ch.name}' → '${sanitized}'`);
+    }
+
+    // Extract text-channel-specific properties
+    const textCh = ch.isTextBased() ? (ch as unknown as TextChannel) : null;
+    const topic = textCh?.topic ?? null;
+    const nsfw = "nsfw" in ch ? (ch as TextChannel).nsfw : false;
+    const slowmodeSeconds = textCh?.rateLimitPerUser ?? 0;
+
+    // Note slowmode — Stoat doesn't support it
+    if (slowmodeSeconds > 0) {
+      warnings.push(`Slowmode ${slowmodeSeconds}s not supported by Stoat`);
+    }
+
+    // Truncate topic to Revolt's 1024-char limit
+    let truncatedTopic = topic;
+    if (topic && topic.length > 1024) {
+      truncatedTopic = topic.slice(0, 1021) + "...";
+      warnings.push(`Topic truncated from ${topic.length} to 1024 chars`);
+    }
+
     mappings.push({
       discordChannel: ch,
       discordId: ch.id,
-      stoatName: sanitizeName(ch.name),
+      stoatName: sanitized,
       stoatType,
       category: ch.parent?.name ?? null,
       position: ch.position,
       selected: true, // selected by default
+      topic: truncatedTopic,
+      nsfw,
+      slowmodeSeconds,
+      originalType: ChannelType[ch.type] ?? String(ch.type),
+      permOverwriteCount: ch.permissionOverwrites?.cache.size ?? 0,
+      warnings,
     });
   }
 

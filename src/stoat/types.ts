@@ -225,6 +225,37 @@ export interface BulkMessagesResponse {
   members?: Member[];
 }
 
+// --- Ban/Member/Emoji types for migration ---
+
+export interface BanInfo {
+  _id: {
+    server: string;
+    user: string;
+  };
+  reason?: string;
+}
+
+export interface MemberListResponse {
+  members: Member[];
+  users: User[];
+}
+
+export interface EmojiInfo {
+  _id: string;
+  parent: {
+    type: "Server";
+    id: string;
+  };
+  creator_id: string;
+  name: string;
+  animated?: boolean;
+  nsfw?: boolean;
+}
+
+export interface AutumnUploadResponse {
+  id: string;
+}
+
 // --- WebSocket (Bonfire) event types ---
 
 export type BonfireEvent =
