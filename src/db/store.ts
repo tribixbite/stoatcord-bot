@@ -17,6 +17,11 @@ const CURRENT_SCHEMA_VERSION = 2;
 export class Store {
   private db: Database;
 
+  /** Expose the raw Database instance for shared use (e.g. push store) */
+  get database(): Database {
+    return this.db;
+  }
+
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
     this.db.run("PRAGMA journal_mode = WAL");

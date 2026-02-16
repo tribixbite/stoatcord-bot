@@ -8,6 +8,12 @@ export interface Config {
   stoatCdnUrl: string;
   stoatAutumnUrl: string;
   dbPath: string;
+  // Push notification relay config
+  pushEnabled: boolean;
+  firebaseServiceAccount: string;
+  vapidPublicKey: string;
+  vapidPrivateKey: string;
+  pushBotApiUrl: string;
 }
 
 export function loadConfig(): Config {
@@ -29,5 +35,12 @@ export function loadConfig(): Config {
     stoatCdnUrl: process.env["STOAT_CDN_URL"] || "https://cdn.stoatusercontent.com",
     stoatAutumnUrl: process.env["STOAT_AUTUMN_URL"] || "https://autumn.stoat.chat",
     dbPath: process.env["DB_PATH"] || "stoatcord.db",
+    // Push notification relay
+    pushEnabled: process.env["PUSH_ENABLED"] !== "false",
+    firebaseServiceAccount:
+      process.env["FIREBASE_SERVICE_ACCOUNT"] || "./firebase-service-account.json",
+    vapidPublicKey: process.env["VAPID_PUBLIC_KEY"] || "",
+    vapidPrivateKey: process.env["VAPID_PRIVATE_KEY"] || "",
+    pushBotApiUrl: process.env["PUSH_BOT_API_URL"] || `http://localhost:${process.env["API_PORT"] || "3210"}`,
   };
 }

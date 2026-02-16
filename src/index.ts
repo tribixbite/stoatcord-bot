@@ -20,6 +20,10 @@ import {
   handleCreateLink,
   handleDeleteLink,
 } from "./api/links.ts";
+import { PushStore } from "./push/store.ts";
+import { FcmSender } from "./push/fcm.ts";
+import { WebPushSender } from "./push/webpush.ts";
+import { setupPushRelay } from "./push/relay.ts";
 
 async function main(): Promise<void> {
   // Load and validate config from .env
@@ -58,6 +62,59 @@ async function main(): Promise<void> {
     console.log("[stoat-ws] Ready — listening for messages");
   });
   stoatWs.connect();
+
+  // Initialize push notification relay system
+  const pushStore = new PushStore(store.database); // share the same bun:sqlite Database instance
+  let fcmSender: FcmSender | null = null;
+  let webPushSender: WebPushSender | null = null;
+
+  if (config.pushEnabled) {
+    // Initialize FCM sender if service account is available
+    try {
+      const saPath = config.firebaseServiceAccount;
+      const file = Bun.file(saPath);
+      if (await file.exists()) {
+        fcmSender = new FcmSender(saPath);
+      } else {
+        console.warn(
+          `[push] Firebase service account not found at ${saPath} — FCM disabled`
+        );
+      }
+    } catch (err) {
+      console.error("[push] Failed to initialize FCM sender:", err);
+    }
+
+    // Initialize WebPush sender if VAPID keys are configured
+    if (config.vapidPublicKey && config.vapidPrivateKey) {
+      webPushSender = new WebPushSender(
+        {
+          publicKey: config.vapidPublicKey,
+          privateKey: config.vapidPrivateKey,
+        }
+      );
+    } else {
+      console.log(
+        "[push] VAPID keys not configured — WebPush/UnifiedPush disabled"
+      );
+    }
+
+    // Set up the relay (hooks into WS message events)
+    setupPushRelay({
+      stoatWs,
+      stoatClient,
+      pushStore,
+      fcmSender,
+      webPushSender,
+      botSelfId,
+      cdnUrl: config.stoatCdnUrl,
+    });
+
+    console.log(
+      `[push] Push relay enabled — FCM: ${fcmSender ? "yes" : "no"}, WebPush: ${webPushSender ? "yes" : "no"}`
+    );
+  } else {
+    console.log("[push] Push relay disabled (PUSH_ENABLED=false)");
+  }
 
   // Create Discord client (needed before setting up Stoat commands that reference it)
   const discordClient = createDiscordClient();
@@ -255,6 +312,12 @@ async function main(): Promise<void> {
                 links: {
                   total: store.getAllActiveChannelLinks().length,
                 },
+                push: {
+                  enabled: config.pushEnabled,
+                  fcmConfigured: fcmSender !== null,
+                  webPushConfigured: webPushSender !== null,
+                  registeredDevices: pushStore.getDeviceCount(),
+                },
               }),
               corsHeaders
             );
@@ -264,6 +327,104 @@ async function main(): Promise<void> {
               { status: 500, headers: corsHeaders }
             );
           }
+        }
+
+        // --- Push notification registration routes ---
+
+        // Route: POST /api/push/register — register a device for push notifications
+        if (url.pathname === "/api/push/register" && method === "POST") {
+          const body = (await req.json()) as {
+            userId: string;
+            deviceId: string;
+            mode: "fcm" | "webpush";
+            fcmToken?: string;
+            endpoint?: string;
+            p256dh?: string;
+            auth?: string;
+          };
+          if (!body.userId || !body.deviceId || !body.mode) {
+            return Response.json(
+              { error: "userId, deviceId, and mode are required" },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+          if (body.mode === "fcm" && !body.fcmToken) {
+            return Response.json(
+              { error: "fcmToken required for FCM mode" },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+          if (body.mode === "webpush" && (!body.endpoint || !body.p256dh || !body.auth)) {
+            return Response.json(
+              { error: "endpoint, p256dh, and auth required for WebPush mode" },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+          pushStore.registerDevice({
+            stoatUserId: body.userId,
+            deviceId: body.deviceId,
+            pushMode: body.mode,
+            fcmToken: body.fcmToken,
+            webpushEndpoint: body.endpoint,
+            webpushP256dh: body.p256dh,
+            webpushAuth: body.auth,
+          });
+          console.log(
+            `[push] Registered device ${body.deviceId} (${body.mode}) for user ${body.userId}`
+          );
+          return addHeaders(
+            Response.json({ ok: true, mode: body.mode }),
+            corsHeaders
+          );
+        }
+
+        // Route: DELETE /api/push/unregister — remove a device registration
+        if (url.pathname === "/api/push/unregister" && method === "DELETE") {
+          const body = (await req.json()) as { deviceId: string };
+          if (!body.deviceId) {
+            return Response.json(
+              { error: "deviceId is required" },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+          const removed = pushStore.unregisterDevice(body.deviceId);
+          console.log(
+            `[push] Unregistered device ${body.deviceId}: ${removed ? "found" : "not found"}`
+          );
+          return addHeaders(
+            Response.json({ ok: true, removed }),
+            corsHeaders
+          );
+        }
+
+        // Route: GET /api/push/status — check device registration status
+        if (url.pathname === "/api/push/status" && method === "GET") {
+          const deviceId = url.searchParams.get("deviceId");
+          if (!deviceId) {
+            return Response.json(
+              { error: "deviceId query param required" },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+          const device = pushStore.getDeviceByDeviceId(deviceId);
+          return addHeaders(
+            Response.json({
+              registered: device !== null,
+              mode: device?.push_mode ?? null,
+              updatedAt: device?.updated_at ?? null,
+            }),
+            corsHeaders
+          );
+        }
+
+        // Route: GET /api/push/vapid — get VAPID public key for WebPush
+        if (url.pathname === "/api/push/vapid" && method === "GET") {
+          return addHeaders(
+            Response.json({
+              vapidPublicKey: config.vapidPublicKey || null,
+            }),
+            corsHeaders
+          );
         }
 
         // 404
