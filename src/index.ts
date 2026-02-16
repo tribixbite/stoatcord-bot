@@ -117,24 +117,30 @@ async function main(): Promise<void> {
   }
 
   // Create Discord client (needed before setting up Stoat commands that reference it)
-  const discordClient = createDiscordClient();
+  let discordClient: ReturnType<typeof createDiscordClient> | null = null;
+  try {
+    discordClient = createDiscordClient();
 
-  // Set up Stoat-side command handler (!stoatcord code, request, status, help)
-  // and reply-based migration approval detection
-  setupStoatCommands(stoatWs, store, stoatClient, botSelfId, discordClient);
+    // Set up Stoat-side command handler (!stoatcord code, request, status, help)
+    // and reply-based migration approval detection
+    setupStoatCommands(stoatWs, store, stoatClient, botSelfId, discordClient);
 
-  // Set up Stoat→Discord message relay
-  setupStoatToDiscordRelay(stoatWs, store, config.stoatCdnUrl, stoatClient);
+    // Set up Stoat→Discord message relay
+    setupStoatToDiscordRelay(stoatWs, store, config.stoatCdnUrl, stoatClient);
 
-  // Register Discord event handlers (includes Discord→Stoat relay)
-  registerDiscordEvents(discordClient, store, stoatClient, config.stoatCdnUrl);
+    // Register Discord event handlers (includes Discord→Stoat relay)
+    registerDiscordEvents(discordClient, store, stoatClient, config.stoatCdnUrl);
 
-  // Login Discord bot
-  await discordClient.login(config.discordToken);
+    // Login Discord bot
+    await discordClient.login(config.discordToken);
 
-  // Register slash commands once logged in
-  if (discordClient.user) {
-    await registerCommands(config.discordToken, discordClient.user.id);
+    // Register slash commands once logged in
+    if (discordClient.user) {
+      await registerCommands(config.discordToken, discordClient.user.id);
+    }
+  } catch (err) {
+    console.warn("[discord] Discord connection failed (push relay still active):", (err as Error).message);
+    discordClient = null;
   }
 
   // Start HTTP API server for Stoat app integration
@@ -169,6 +175,7 @@ async function main(): Promise<void> {
       try {
         // Route: GET /api/guilds
         if (url.pathname === "/api/guilds" && method === "GET") {
+          if (!discordClient) return Response.json({ error: "Discord not connected" }, { status: 503, headers: corsHeaders });
           return addHeaders(handleListGuilds(discordClient), corsHeaders);
         }
 
