@@ -1,5 +1,10 @@
 /** Environment configuration with validation */
 
+import { resolve, dirname } from "path";
+
+// Project root for resolving relative paths (CWD unreliable under grun)
+const PROJECT_ROOT = resolve(dirname(import.meta.dir));
+
 export interface Config {
   discordToken: string;
   stoatToken: string;
@@ -34,11 +39,13 @@ export function loadConfig(): Config {
     stoatWsUrl: process.env["STOAT_WS_URL"] || "wss://events.stoat.chat",
     stoatCdnUrl: process.env["STOAT_CDN_URL"] || "https://cdn.stoatusercontent.com",
     stoatAutumnUrl: process.env["STOAT_AUTUMN_URL"] || "https://autumn.stoat.chat",
-    dbPath: process.env["DB_PATH"] || "stoatcord.db",
+    dbPath: resolve(PROJECT_ROOT, process.env["DB_PATH"] || "stoatcord.db"),
     // Push notification relay
     pushEnabled: process.env["PUSH_ENABLED"] !== "false",
-    firebaseServiceAccount:
-      process.env["FIREBASE_SERVICE_ACCOUNT"] || "./firebase-service-account.json",
+    firebaseServiceAccount: resolve(
+      PROJECT_ROOT,
+      process.env["FIREBASE_SERVICE_ACCOUNT"] || "firebase-service-account.json"
+    ),
     vapidPublicKey: process.env["VAPID_PUBLIC_KEY"] || "",
     vapidPrivateKey: process.env["VAPID_PRIVATE_KEY"] || "",
     pushBotApiUrl: process.env["PUSH_BOT_API_URL"] || `http://localhost:${process.env["API_PORT"] || "3210"}`,

@@ -6,9 +6,12 @@
  */
 
 import { readFileSync, existsSync } from "fs";
-import { resolve } from "path";
+import { resolve, dirname } from "path";
 
-const envPath = resolve(process.cwd(), ".env");
+// Use the project root (parent of src/) rather than process.cwd(),
+// which may be wrong under glibc-runner (grun) on ARM64 Termux
+const projectRoot = resolve(dirname(import.meta.dir));
+const envPath = resolve(projectRoot, ".env");
 
 if (existsSync(envPath)) {
   const content = readFileSync(envPath, "utf8");
