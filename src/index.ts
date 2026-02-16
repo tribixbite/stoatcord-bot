@@ -361,12 +361,15 @@ async function main(): Promise<void> {
               { status: 400, headers: corsHeaders }
             );
           }
-          if (body.mode === "webpush" && (!body.endpoint || !body.p256dh || !body.auth)) {
+          if (body.mode === "webpush" && !body.endpoint) {
             return Response.json(
-              { error: "endpoint, p256dh, and auth required for WebPush mode" },
+              { error: "endpoint required for WebPush mode" },
               { status: 400, headers: corsHeaders }
             );
           }
+          // p256dh and auth are optional — UnifiedPush distributors like ntfy
+          // don't provide WebPush encryption keys, so relay.ts falls back to
+          // plain HTTP POST for endpoints without them
           pushStore.registerDevice({
             stoatUserId: body.userId,
             deviceId: body.deviceId,
