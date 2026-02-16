@@ -151,26 +151,52 @@ export function setupPushRelay(opts: {
           }
         } else if (
           device.push_mode === "webpush" &&
-          device.webpush_endpoint &&
-          device.webpush_p256dh &&
-          device.webpush_auth &&
-          webPushSender
+          device.webpush_endpoint
         ) {
-          const success = await webPushSender.sendNotification(
-            {
-              endpoint: device.webpush_endpoint,
-              p256dh: device.webpush_p256dh,
-              auth: device.webpush_auth,
-            },
-            notificationPayload
-          );
-          if (!success) {
-            console.log(
-              `[push:relay] Removing expired WebPush device ${device.device_id}`
+          // WebPush with encryption keys (RFC 8291)
+          if (device.webpush_p256dh && device.webpush_auth && webPushSender) {
+            const success = await webPushSender.sendNotification(
+              {
+                endpoint: device.webpush_endpoint,
+                p256dh: device.webpush_p256dh,
+                auth: device.webpush_auth,
+              },
+              notificationPayload
             );
-            pushStore.unregisterDevice(device.device_id);
+            if (!success) {
+              console.log(
+                `[push:relay] Removing expired WebPush device ${device.device_id}`
+              );
+              pushStore.unregisterDevice(device.device_id);
+            } else {
+              sentCount++;
+            }
           } else {
-            sentCount++;
+            // Plain HTTP POST for UP endpoints without encryption keys (e.g., ntfy)
+            try {
+              const res = await fetch(device.webpush_endpoint, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: notificationPayload,
+              });
+              if (res.ok) {
+                sentCount++;
+              } else if (res.status === 404 || res.status === 410) {
+                console.log(
+                  `[push:relay] Removing expired UP endpoint ${device.device_id}`
+                );
+                pushStore.unregisterDevice(device.device_id);
+              } else {
+                console.warn(
+                  `[push:relay] UP plain POST failed for ${device.device_id}: ${res.status}`
+                );
+              }
+            } catch (err) {
+              console.warn(
+                `[push:relay] UP plain POST error for ${device.device_id}:`,
+                err
+              );
+            }
           }
         }
       }
