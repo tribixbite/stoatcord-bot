@@ -69,15 +69,16 @@ async function main(): Promise<void> {
   let webPushSender: WebPushSender | null = null;
 
   if (config.pushEnabled) {
-    // Initialize FCM sender if service account is available
+    // Initialize FCM sender if service account is available (file or env var)
     try {
       const saPath = config.firebaseServiceAccount;
-      const file = Bun.file(saPath);
-      if (await file.exists()) {
+      const hasEnvJson = !!process.env["FIREBASE_SA_JSON"];
+      const hasFile = await Bun.file(saPath).exists();
+      if (hasEnvJson || hasFile) {
         fcmSender = new FcmSender(saPath);
       } else {
         console.warn(
-          `[push] Firebase service account not found at ${saPath} — FCM disabled`
+          `[push] Firebase service account not found at ${saPath} and FIREBASE_SA_JSON not set — FCM disabled`
         );
       }
     } catch (err) {
