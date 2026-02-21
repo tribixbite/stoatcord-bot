@@ -1,0 +1,14 @@
+.env
+.env.*
+*.db
+*.db-wal
+*.db-shm
+firebase-service-account.json
+node_modules
+output/
+.git
+CLAUDE.md
+scrape-gifs.ts
+check-all.ts
+check-devices.ts
+test-push.ts

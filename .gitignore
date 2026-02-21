@@ -42,3 +42,12 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Firebase service account key (NEVER commit)
 firebase-service-account.json
+
+# Dev utility scripts (local-only)
+check-all.ts
+check-devices.ts
+test-push.ts
+scrape-gifs.ts
+
+# Output artifacts
+output/

@@ -144,7 +144,7 @@ async function main(): Promise<void> {
   }
 
   // Start HTTP API server for Stoat app integration
-  const apiPort = parseInt(process.env["API_PORT"] || "3210", 10);
+  const apiPort = parseInt(process.env["PORT"] || process.env["API_PORT"] || "3210", 10);
   const apiKey = process.env["API_KEY"] || "";
 
   const corsHeaders: Record<string, string> = {

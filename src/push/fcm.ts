@@ -20,12 +20,21 @@ export class FcmSender {
   private cachedToken: CachedToken | null = null;
 
   constructor(serviceAccountPath: string) {
-    const raw = Bun.file(serviceAccountPath);
-    // Synchronous read via JSON import — Bun supports this
-    const json = JSON.parse(
-      // bun:file .text() is async, so we use readFileSync for constructor
-      require("fs").readFileSync(serviceAccountPath, "utf-8")
-    ) as ServiceAccount;
+    // Prefer FIREBASE_SA_JSON env var (for containerized deployments),
+    // fall back to reading from disk
+    const envJson = process.env["FIREBASE_SA_JSON"];
+    let json: ServiceAccount;
+
+    if (envJson) {
+      json = JSON.parse(envJson) as ServiceAccount;
+      console.log("[push:fcm] Loaded service account from FIREBASE_SA_JSON env var");
+    } else {
+      // Synchronous read — bun:file .text() is async, so use readFileSync for constructor
+      json = JSON.parse(
+        require("fs").readFileSync(serviceAccountPath, "utf-8")
+      ) as ServiceAccount;
+      console.log(`[push:fcm] Loaded service account from ${serviceAccountPath}`);
+    }
 
     if (!json.project_id || !json.private_key || !json.client_email) {
       throw new Error(
