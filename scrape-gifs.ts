@@ -103,6 +103,41 @@ interface ProgressState {
 
 // ── Progress management ─────────────────────────────────────────────────────
 
+/**
+ * Rebuild progress from existing NDJSON when the progress file is lost.
+ * Scans channel IDs present in the NDJSON so we don't re-scrape them.
+ * Lightweight: only reads channelId from each line, doesn't hold entries.
+ */
+async function rebuildProgressFromNdjson(): Promise<ProgressState> {
+  const ndjsonFile = Bun.file(NDJSON_PATH);
+  if (!(await ndjsonFile.exists())) {
+    return { completedChannels: [], totalGifs: 0, current: null };
+  }
+
+  console.log("Progress file missing — rebuilding from existing NDJSON…");
+  const channelIds = new Set<string>();
+  let totalGifs = 0;
+
+  const rl = createInterface({ input: createReadStream(NDJSON_PATH), crlfDelay: Infinity });
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    totalGifs++;
+    // Fast parse: just extract channelId without full JSON.parse
+    const match = line.match(/"channelId":"([^"]+)"/);
+    if (match?.[1]) channelIds.add(match[1]);
+  }
+
+  const state: ProgressState = {
+    completedChannels: [...channelIds],
+    totalGifs,
+    current: null, // can't know the cursor, so treat all found channels as complete
+  };
+
+  console.log(`Recovered ${channelIds.size} channels, ${totalGifs} entries from NDJSON`);
+  await saveProgress(state);
+  return state;
+}
+
 async function loadProgress(): Promise<ProgressState> {
   try {
     const file = Bun.file(PROGRESS_PATH);
@@ -110,7 +145,9 @@ async function loadProgress(): Promise<ProgressState> {
       return await file.json() as ProgressState;
     }
   } catch { /* ignore corrupt file */ }
-  return { completedChannels: [], totalGifs: 0, current: null };
+
+  // No progress file — check if NDJSON exists and rebuild from it
+  return await rebuildProgressFromNdjson();
 }
 
 async function saveProgress(state: ProgressState): Promise<void> {
