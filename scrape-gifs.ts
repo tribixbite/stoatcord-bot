@@ -3,28 +3,35 @@
  * Standalone GIF scraper for a Discord guild.
  * Pulls all GIF URLs (tenor, giphy, klipy, gfycat, imgur, etc.)
  * from every accessible text channel and streams them to NDJSON on disk.
- * Final markdown is generated from the NDJSON at the end.
  *
- * Memory-safe: entries are flushed to disk per-channel, never held in bulk.
+ * Crash-safe: saves cursor position every 50 pages (~5k messages) so it
+ * can resume mid-channel after OOM or network failure. Always resumes
+ * automatically unless --fresh is passed.
  *
- * Usage: bun scrape-gifs.ts [--dry-run] [--channel <id>] [--resume]
+ * Usage:
+ *   bun scrape-gifs.ts              # run (auto-resumes if prior progress exists)
+ *   bun scrape-gifs.ts --fresh      # wipe prior progress and start from scratch
+ *   bun scrape-gifs.ts --channel ID # scrape a single channel only
+ *   bun scrape-gifs.ts --md-only    # skip scraping, just generate markdown from NDJSON
  */
 
 import { REST, Routes, type APIMessage, type APIChannel, ChannelType } from "discord.js";
 import { resolve } from "path";
-import { mkdir, appendFile, unlink, readFile, writeFile } from "node:fs/promises";
+import { mkdir, appendFile, unlink, writeFile } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-// import.meta.dir is the directory of this script (project root for root-level scripts)
 const PROJECT_ROOT = import.meta.dir;
 const GUILD_ID = "793967107116236841";
 const OUTPUT_DIR = resolve(PROJECT_ROOT, "output");
-const NDJSON_PATH = resolve(OUTPUT_DIR, "gifs.ndjson");    // streaming append target
-const MD_PATH = resolve(OUTPUT_DIR, "gifs.md");            // final markdown output
-const PROGRESS_PATH = resolve(OUTPUT_DIR, "gifs-progress.json"); // lightweight: just channel IDs + counts
+const NDJSON_PATH = resolve(OUTPUT_DIR, "gifs.ndjson");
+const MD_PATH = resolve(OUTPUT_DIR, "gifs.md");
+const PROGRESS_PATH = resolve(OUTPUT_DIR, "gifs-progress.json");
+
+/** How often to flush progress (in pages of 100 messages each) */
+const PROGRESS_FLUSH_INTERVAL = 50; // every ~5k messages
 
 /**
  * Domains where ANY URL is a GIF/animation link (landing pages + media).
@@ -40,33 +47,30 @@ const GIF_DOMAINS = [
   "klipy.com",
   "gfycat.com",
   "thumbs.gfycat.com",
-  "imgur.com",  // imgur gif links (direct and album)
+  "imgur.com",
   "i.imgur.com",
 ];
 
-/** File extensions that are GIFs */
 const GIF_EXTENSIONS = [".gif", ".gifv"];
-
-/** URL regex (loose — we filter by domain after) */
 const URL_REGEX = /https?:\/\/[^\s<>"')\]]+/gi;
 
 // ── CLI args ────────────────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
-const DRY_RUN = args.includes("--dry-run");
-const RESUME = args.includes("--resume");
+const FRESH = args.includes("--fresh");
+const MD_ONLY = args.includes("--md-only");
 const channelFlagIdx = args.indexOf("--channel");
 const CHANNEL_FILTER = channelFlagIdx !== -1 ? args[channelFlagIdx + 1] : null;
 
 // ── Discord REST client ─────────────────────────────────────────────────────
 
 const token = process.env["DISCORD_TOKEN"];
-if (!token) {
+if (!token && !MD_ONLY) {
   console.error("DISCORD_TOKEN is required — set it in .env");
   process.exit(1);
 }
 
-const rest = new REST({ version: "10" }).setToken(token);
+const rest = !MD_ONLY ? new REST({ version: "10" }).setToken(token!) : null!;
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -79,13 +83,25 @@ interface GifEntry {
   timestamp: string;
 }
 
-/** Lightweight progress — no gif data, just completed channel IDs */
+/**
+ * Crash-safe progress state.
+ * Tracks completed channels AND the cursor within the current channel
+ * so we can resume mid-channel after OOM/crash.
+ */
 interface ProgressState {
-  completedChannels: string[];
-  totalGifs: number;
+  completedChannels: string[];   // fully-scraped channel IDs
+  totalGifs: number;             // running total across all channels
+  /** Cursor for the channel currently being scraped (null if between channels) */
+  current: {
+    channelId: string;
+    channelName: string;
+    lastMessageId: string;       // Discord snowflake — resume pagination from here
+    gifCount: number;            // gifs found so far in this channel
+    pagesScanned: number;
+  } | null;
 }
 
-// ── Progress management (lightweight — no gif data in memory) ───────────────
+// ── Progress management ─────────────────────────────────────────────────────
 
 async function loadProgress(): Promise<ProgressState> {
   try {
@@ -94,14 +110,18 @@ async function loadProgress(): Promise<ProgressState> {
       return await file.json() as ProgressState;
     }
   } catch { /* ignore corrupt file */ }
-  return { completedChannels: [], totalGifs: 0 };
+  return { completedChannels: [], totalGifs: 0, current: null };
 }
 
 async function saveProgress(state: ProgressState): Promise<void> {
-  await writeFile(PROGRESS_PATH, JSON.stringify(state));
+  // Write to temp file then rename for atomicity
+  const tmp = PROGRESS_PATH + ".tmp";
+  await writeFile(tmp, JSON.stringify(state));
+  await Bun.write(PROGRESS_PATH, await Bun.file(tmp).text());
+  try { await unlink(tmp); } catch {}
 }
 
-/** Append an array of GifEntry to the NDJSON file (one JSON object per line) */
+/** Append GifEntries to NDJSON (one JSON object per line) */
 async function appendGifs(entries: GifEntry[]): Promise<void> {
   if (!entries.length) return;
   const lines = entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
@@ -110,7 +130,6 @@ async function appendGifs(entries: GifEntry[]): Promise<void> {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/** Check whether a URL looks like a GIF */
 function isGifUrl(url: string): boolean {
   const lower = url.toLowerCase();
   if (GIF_EXTENSIONS.some((ext) => lower.includes(ext))) return true;
@@ -118,7 +137,6 @@ function isGifUrl(url: string): boolean {
   return false;
 }
 
-/** Extract all GIF URLs from a single message */
 function extractGifs(msg: APIMessage, channelName: string): GifEntry[] {
   const found = new Set<string>();
   const entries: GifEntry[] = [];
@@ -130,28 +148,21 @@ function extractGifs(msg: APIMessage, channelName: string): GifEntry[] {
     timestamp: msg.timestamp,
   };
 
-  // 1. URLs in message content
-  const contentUrls = msg.content?.match(URL_REGEX) ?? [];
-  for (const url of contentUrls) {
+  // URLs in message content
+  for (const url of msg.content?.match(URL_REGEX) ?? []) {
     if (isGifUrl(url) && !found.has(url)) {
       found.add(url);
       entries.push({ ...base, url });
     }
   }
 
-  // 2. Embeds (tenor/giphy/klipy show up as rich embeds with video or image)
+  // Embeds (tenor/giphy/klipy appear as rich embeds)
   for (const embed of msg.embeds ?? []) {
-    const candidates = [
-      embed.url,
-      embed.thumbnail?.url,
-      embed.thumbnail?.proxy_url,
-      embed.video?.url,
-      embed.video?.proxy_url,
-      embed.image?.url,
-      embed.image?.proxy_url,
-    ].filter(Boolean) as string[];
-
-    for (const url of candidates) {
+    for (const url of [
+      embed.url, embed.thumbnail?.url, embed.thumbnail?.proxy_url,
+      embed.video?.url, embed.video?.proxy_url,
+      embed.image?.url, embed.image?.proxy_url,
+    ].filter(Boolean) as string[]) {
       if (isGifUrl(url) && !found.has(url)) {
         found.add(url);
         entries.push({ ...base, url });
@@ -159,7 +170,7 @@ function extractGifs(msg: APIMessage, channelName: string): GifEntry[] {
     }
   }
 
-  // 3. Attachments (direct .gif uploads)
+  // Attachments (direct .gif uploads)
   for (const att of msg.attachments ?? []) {
     if (isGifUrl(att.url) && !found.has(att.url)) {
       found.add(att.url);
@@ -170,59 +181,76 @@ function extractGifs(msg: APIMessage, channelName: string): GifEntry[] {
   return entries;
 }
 
+/** Fetch a page of messages with exponential-backoff retry */
+async function fetchPage(channelId: string, before?: string): Promise<APIMessage[] | null> {
+  const query: Record<string, string> = { limit: "100" };
+  if (before) query.before = before;
+
+  const MAX_RETRIES = 8;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return (await rest.get(Routes.channelMessages(channelId), {
+        query: new URLSearchParams(query),
+      })) as APIMessage[];
+    } catch (err: any) {
+      if (err.status === 403 || err.status === 404) return null; // no access
+      const isTransient = ["ConnectionRefused", "ECONNRESET", "ETIMEDOUT"].includes(err.code)
+        || [429, 500, 502, 503].includes(err.status);
+      if (isTransient && attempt < MAX_RETRIES) {
+        const delay = Math.min(2000 * Math.pow(2, attempt), 60_000);
+        console.log(`  ⟳ Retry ${attempt + 1}/${MAX_RETRIES} in ${(delay / 1000).toFixed(0)}s (${err.code ?? err.status})…`);
+        await Bun.sleep(delay);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 /**
- * Fetch all messages from a channel, streaming GIF entries to disk.
- * Returns the count of gifs found (entries are NOT held in memory).
+ * Scrape a single channel, streaming gifs to NDJSON and saving cursor
+ * progress periodically. Can resume mid-channel via the cursor in progress.
  */
-async function fetchAndStreamChannel(channelId: string, channelName: string): Promise<number> {
+async function scrapeChannel(
+  channelId: string,
+  channelName: string,
+  progress: ProgressState,
+): Promise<number> {
+  // Check if we have a mid-channel cursor to resume from
   let before: string | undefined;
   let page = 0;
   let gifCount = 0;
 
+  if (progress.current?.channelId === channelId && progress.current.lastMessageId) {
+    before = progress.current.lastMessageId;
+    page = progress.current.pagesScanned;
+    gifCount = progress.current.gifCount;
+    console.log(`  ↺ Resuming from message ${before} (page ~${page}, ${gifCount} gifs already)`);
+  }
+
+  // Set current channel cursor
+  progress.current = {
+    channelId,
+    channelName,
+    lastMessageId: before ?? "",
+    gifCount,
+    pagesScanned: page,
+  };
+
   while (true) {
-    const query: Record<string, string> = { limit: "100" };
-    if (before) query.before = before;
-
-    let messages: APIMessage[];
-    const MAX_RETRIES = 5;
-    let attempt = 0;
-    while (true) {
-      try {
-        messages = (await rest.get(Routes.channelMessages(channelId), {
-          query: new URLSearchParams(query),
-        })) as APIMessage[];
-        break;
-      } catch (err: any) {
-        if (err.status === 403 || err.status === 404) {
-          console.log(`  ⊘ No access to #${channelName} (${channelId}), skipping`);
-          return gifCount;
-        }
-        const isTransient = err.code === "ConnectionRefused"
-          || err.code === "ECONNRESET"
-          || err.code === "ETIMEDOUT"
-          || err.status === 429
-          || err.status === 500
-          || err.status === 502
-          || err.status === 503;
-        if (isTransient && attempt < MAX_RETRIES) {
-          attempt++;
-          const delay = Math.min(2000 * Math.pow(2, attempt), 60_000);
-          console.log(`  ⟳ Retry ${attempt}/${MAX_RETRIES} in ${(delay / 1000).toFixed(0)}s (${err.code ?? err.status})…`);
-          await Bun.sleep(delay);
-          continue;
-        }
-        throw err;
-      }
+    const messages = await fetchPage(channelId, before);
+    if (messages === null) {
+      console.log(`  ⊘ No access to #${channelName} (${channelId}), skipping`);
+      return gifCount;
     }
-
     if (!messages.length) break;
 
-    // Extract gifs from this batch and flush to disk immediately
+    // Extract gifs and flush to disk immediately
     const batch: GifEntry[] = [];
     for (const msg of messages) {
       batch.push(...extractGifs(msg, channelName));
     }
-    if (batch.length && !DRY_RUN) {
+    if (batch.length) {
       await appendGifs(batch);
     }
     gifCount += batch.length;
@@ -230,8 +258,17 @@ async function fetchAndStreamChannel(channelId: string, channelName: string): Pr
     before = messages[messages.length - 1].id;
     page++;
 
-    if (page % 10 === 0) {
-      console.log(`  … #${channelName}: ${page * 100}+ messages scanned, ${gifCount} gifs so far`);
+    // Update cursor in progress state
+    progress.current.lastMessageId = before;
+    progress.current.gifCount = gifCount;
+    progress.current.pagesScanned = page;
+
+    // Flush progress to disk periodically
+    if (page % PROGRESS_FLUSH_INTERVAL === 0) {
+      await saveProgress(progress);
+      console.log(`  … #${channelName}: ${page * 100}+ msgs, ${gifCount} gifs [saved]`);
+    } else if (page % 10 === 0) {
+      console.log(`  … #${channelName}: ${page * 100}+ msgs, ${gifCount} gifs`);
     }
   }
 
@@ -240,11 +277,16 @@ async function fetchAndStreamChannel(channelId: string, channelName: string): Pr
 
 // ── Markdown generation (streaming read from NDJSON) ────────────────────────
 
-/** Read the NDJSON file line-by-line and produce the final markdown */
 async function generateMarkdown(): Promise<void> {
-  console.log("\nGenerating markdown from NDJSON…");
+  const ndjsonFile = Bun.file(NDJSON_PATH);
+  if (!(await ndjsonFile.exists())) {
+    console.log("No NDJSON file found — nothing to generate.");
+    return;
+  }
 
-  // First pass: group URLs by channel, dedup by URL
+  console.log("Generating markdown from NDJSON…");
+
+  // Stream-read NDJSON, group by channel, dedup by URL
   const byChannel = new Map<string, GifEntry[]>();
   const seen = new Set<string>();
   let total = 0;
@@ -263,32 +305,26 @@ async function generateMarkdown(): Promise<void> {
     byChannel.set(entry.channelName, list);
   }
 
-  console.log(`Total GIF entries: ${total}, unique URLs: ${unique}`);
+  console.log(`Total entries: ${total}, unique URLs: ${unique}`);
 
-  // Build markdown in chunks to avoid huge string concat
   const sortedChannels = [...byChannel.entries()].sort((a, b) => a[0].localeCompare(b[0]));
 
-  // Write header
   let md = `# GIFs scraped from Discord guild ${GUILD_ID}\n\n`;
   md += `> Generated ${new Date().toISOString()}\n`;
   md += `> Total unique GIFs: ${unique}\n\n`;
 
-  // Write channel sections
   for (const [channelName, gifs] of sortedChannels) {
     md += `## #${channelName} (${gifs.length} gifs)\n\n`;
     gifs.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
     for (const g of gifs) {
       const date = new Date(g.timestamp).toISOString().slice(0, 10);
-      md += `- ${g.url}  \n`;
-      md += `  *${g.authorTag} — ${date}*\n`;
+      md += `- ${g.url}  \n  *${g.authorTag} — ${date}*\n`;
     }
     md += "\n";
   }
 
   await writeFile(MD_PATH, md);
   console.log(`Written to ${MD_PATH}`);
-
-  // Free the map
   byChannel.clear();
   seen.clear();
 }
@@ -296,25 +332,35 @@ async function generateMarkdown(): Promise<void> {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log(`Scraping GIFs from guild ${GUILD_ID}…`);
-  if (DRY_RUN) console.log("(dry-run mode — no files will be written)");
-  if (RESUME) console.log("(resume mode — skipping already-scraped channels)");
-  if (CHANNEL_FILTER) console.log(`Filtering to channel: ${CHANNEL_FILTER}`);
+  // --md-only: skip scraping, just rebuild markdown from existing NDJSON
+  if (MD_ONLY) {
+    await generateMarkdown();
+    return;
+  }
 
+  console.log(`Scraping GIFs from guild ${GUILD_ID}…`);
   await mkdir(OUTPUT_DIR, { recursive: true });
 
-  // Load prior progress if resuming
-  const progress = RESUME ? await loadProgress() : { completedChannels: [], totalGifs: 0 };
+  // Load or reset progress
+  let progress: ProgressState;
+  if (FRESH) {
+    console.log("(--fresh: starting from scratch)");
+    try { await unlink(NDJSON_PATH); } catch {}
+    try { await unlink(PROGRESS_PATH); } catch {}
+    progress = { completedChannels: [], totalGifs: 0, current: null };
+  } else {
+    progress = await loadProgress();
+    if (progress.completedChannels.length || progress.current) {
+      const resumeInfo = progress.current
+        ? `mid-channel ${progress.current.channelName} (page ~${progress.current.pagesScanned})`
+        : "between channels";
+      console.log(`Resuming: ${progress.completedChannels.length} channels done, ${progress.totalGifs} gifs, ${resumeInfo}`);
+    }
+  }
+
+  if (CHANNEL_FILTER) console.log(`Filtering to channel: ${CHANNEL_FILTER}`);
+
   const completedSet = new Set(progress.completedChannels);
-
-  // If not resuming, clear any prior NDJSON
-  if (!RESUME) {
-    try { await unlink(NDJSON_PATH); } catch { /* didn't exist */ }
-  }
-
-  if (RESUME && completedSet.size) {
-    console.log(`Resuming: ${completedSet.size} channels done, ${progress.totalGifs} gifs on disk`);
-  }
 
   // Get all channels in the guild
   const allChannels = (await rest.get(Routes.guildChannels(GUILD_ID))) as APIChannel[];
@@ -340,22 +386,37 @@ async function main() {
 
   for (const ch of channels) {
     const name = (ch as any).name ?? ch.id;
+
+    // Skip fully completed channels
     if (completedSet.has(ch.id)) {
-      console.log(`Skipping #${name} (${ch.id}) — already scraped`);
+      console.log(`Skipping #${name} (${ch.id}) — done`);
       continue;
     }
+
+    // If we have a mid-channel cursor for a DIFFERENT channel, that channel
+    // was interrupted — it's already partially in the NDJSON, we just resume it.
+    // If the cursor is for THIS channel, scrapeChannel handles the resume.
+    // If the cursor is for a different channel that's not yet in completedSet,
+    // mark it complete (its partial data is in NDJSON) and move on.
+    if (progress.current && progress.current.channelId !== ch.id && !completedSet.has(progress.current.channelId)) {
+      // The prior channel was interrupted before completion — skip for now,
+      // we'll encounter it in the channel list and resume it properly.
+    }
+
     console.log(`Scanning #${name} (${ch.id})…`);
-    const count = await fetchAndStreamChannel(ch.id, name);
-    if (count) console.log(`  ✓ ${count} gifs found`);
+    const count = await scrapeChannel(ch.id, name, progress);
+    if (count) console.log(`  ✓ ${count} gifs`);
     totalGifs += count;
 
-    // Save lightweight progress (just channel ID + running total)
+    // Mark channel complete, clear cursor
     progress.completedChannels.push(ch.id);
     progress.totalGifs = totalGifs;
-    if (!DRY_RUN) await saveProgress(progress);
+    progress.current = null;
+    await saveProgress(progress);
+    completedSet.add(ch.id);
   }
 
-  // Also scan active threads
+  // Scan active threads
   try {
     const activeThreads = (await rest.get(Routes.guildActiveThreads(GUILD_ID))) as { threads: APIChannel[] };
     const threadChannels = activeThreads.threads.filter((t: any) =>
@@ -367,33 +428,33 @@ async function main() {
       for (const th of threadChannels) {
         const name = (th as any).name ?? th.id;
         if (completedSet.has(th.id)) {
-          console.log(`  Skipping thread ${name} — already scraped`);
+          console.log(`  Skipping thread ${name} — done`);
           continue;
         }
         console.log(`  Thread: ${name} (${th.id})`);
-        const count = await fetchAndStreamChannel(th.id, `thread:${name}`);
-        if (count) console.log(`    ✓ ${count} gifs found`);
+        const count = await scrapeChannel(th.id, `thread:${name}`, progress);
+        if (count) console.log(`    ✓ ${count} gifs`);
         totalGifs += count;
         progress.completedChannels.push(th.id);
         progress.totalGifs = totalGifs;
-        if (!DRY_RUN) await saveProgress(progress);
+        progress.current = null;
+        await saveProgress(progress);
+        completedSet.add(th.id);
       }
     }
   } catch {
     console.log("Could not fetch active threads (may lack permission)");
   }
 
-  console.log(`\n━━━ Results ━━━`);
-  console.log(`Total GIF entries written: ${totalGifs}`);
+  console.log(`\n━━━ Done ━━━`);
+  console.log(`Total GIF entries: ${totalGifs}`);
 
-  if (DRY_RUN) return;
-
-  // Generate final markdown from the NDJSON (streaming read, no bulk memory)
+  // Generate markdown
   await generateMarkdown();
 
-  // Clean up progress file on success
+  // Clean up progress file
   try { await unlink(PROGRESS_PATH); } catch {}
-  console.log("Progress file cleaned up (scrape complete)");
+  console.log("Scrape complete, progress file cleaned up.");
 }
 
 main().catch((err) => {
