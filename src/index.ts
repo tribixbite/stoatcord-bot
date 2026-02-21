@@ -309,9 +309,9 @@ async function main(): Promise<void> {
                   isBot: !!self.bot,
                 },
                 discord: {
-                  connected: discordClient.isReady(),
-                  guilds: discordClient.guilds.cache.size,
-                  user: discordClient.user?.tag ?? null,
+                  connected: discordClient?.isReady() ?? false,
+                  guilds: discordClient?.guilds.cache.size ?? 0,
+                  user: discordClient?.user?.tag ?? null,
                 },
                 stoat: {
                   wsConnected: stoatWs.isConnected(),
