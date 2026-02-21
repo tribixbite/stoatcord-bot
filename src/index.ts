@@ -159,8 +159,8 @@ async function main(): Promise<void> {
       const url = new URL(req.url);
       const method = req.method;
 
-      // Auth check — require API key if configured
-      if (apiKey && req.headers.get("x-api-key") !== apiKey) {
+      // Auth check — require API key if configured (exempt healthcheck endpoint)
+      if (apiKey && url.pathname !== "/api/diag" && req.headers.get("x-api-key") !== apiKey) {
         return Response.json({ error: "Unauthorized" }, {
           status: 401,
           headers: corsHeaders,
