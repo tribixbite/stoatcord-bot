@@ -60,6 +60,11 @@ async function main(): Promise<void> {
   if (prunedBridge > 0) {
     console.log(`[db] Pruned ${prunedBridge} old bridge message mapping(s)`);
   }
+  // Backfill API tokens for any pre-existing server links without one
+  const backfilled = store.backfillApiTokens();
+  if (backfilled > 0) {
+    console.log(`[db] Backfilled API tokens for ${backfilled} server link(s)`);
+  }
 
   // Connect Stoat WebSocket for realtime events
   const stoatWs = new StoatWebSocket(config.stoatToken, config.stoatWsUrl);
@@ -162,7 +167,7 @@ async function main(): Promise<void> {
 
   const corsHeaders: Record<string, string> = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "x-api-key, content-type",
+    "Access-Control-Allow-Headers": "x-api-key, content-type, authorization",
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
   };
 
@@ -450,49 +455,63 @@ async function main(): Promise<void> {
           );
         }
 
-        // --- Archive API routes ---
+        // --- Archive API routes (guild-scoped Bearer token auth) ---
 
         // Route: GET /api/archive/status — get archive job status
         if (url.pathname === "/api/archive/status" && method === "GET") {
-          const guildId = url.searchParams.get("guildId");
-          const jobId = url.searchParams.get("jobId");
+          const auth = resolveGuildFromBearerToken(req, store);
+          if ("error" in auth) {
+            return Response.json({ error: auth.error }, { status: auth.status, headers: corsHeaders });
+          }
+          const authedGuildId = auth.guildId;
 
+          const jobId = url.searchParams.get("jobId");
           if (jobId) {
             const job = store.getArchiveJob(jobId);
             if (!job) {
+              return Response.json({ error: "Job not found" }, { status: 404, headers: corsHeaders });
+            }
+            // Enforce guild scoping — job must belong to the authed guild
+            if (job.guild_id !== authedGuildId) {
               return Response.json({ error: "Job not found" }, { status: 404, headers: corsHeaders });
             }
             const counts = store.getArchiveMessageCounts(jobId);
             return addHeaders(Response.json({ ...job, counts }), corsHeaders);
           }
 
-          if (guildId) {
-            const jobs = store.getArchiveJobsForGuild(guildId);
-            return addHeaders(Response.json({ jobs }), corsHeaders);
-          }
-
-          return Response.json(
-            { error: "guildId or jobId query param required" },
-            { status: 400, headers: corsHeaders }
-          );
+          // Return all jobs for the authed guild
+          const jobs = store.getArchiveJobsForGuild(authedGuildId);
+          return addHeaders(Response.json({ jobs }), corsHeaders);
         }
 
         // Route: POST /api/archive/start — start an archive export
         if (url.pathname === "/api/archive/start" && method === "POST") {
+          const auth = resolveGuildFromBearerToken(req, store);
+          if ("error" in auth) {
+            return Response.json({ error: auth.error }, { status: auth.status, headers: corsHeaders });
+          }
           if (!discordClient) return Response.json({ error: "Discord not connected" }, { status: 503, headers: corsHeaders });
 
           const body = (await req.json()) as {
-            guildId: string;
             discordChannelId: string;
             stoatChannelId?: string;
             rehostAttachments?: boolean;
             preserveEmbeds?: boolean;
           };
 
-          if (!body.guildId || !body.discordChannelId) {
+          if (!body.discordChannelId) {
             return Response.json(
-              { error: "guildId and discordChannelId are required" },
+              { error: "discordChannelId is required" },
               { status: 400, headers: corsHeaders }
+            );
+          }
+
+          // Verify the channel belongs to the authed guild
+          const channel = discordClient.channels.cache.get(body.discordChannelId);
+          if (!channel || !("guildId" in channel) || channel.guildId !== auth.guildId) {
+            return Response.json(
+              { error: "Channel not found in your guild" },
+              { status: 403, headers: corsHeaders }
             );
           }
 
@@ -510,7 +529,7 @@ async function main(): Promise<void> {
           const { registerJob: regJob, unregisterJob: unregJob } = await import("./archive/manager.ts");
 
           const jobId = store.createArchiveJob({
-            guildId: body.guildId,
+            guildId: auth.guildId,
             discordChannelId: body.discordChannelId,
             discordChannelName: body.discordChannelId,
             stoatChannelId: body.stoatChannelId,
@@ -535,12 +554,18 @@ async function main(): Promise<void> {
 
         // Route: POST /api/archive/pause — pause a running job
         if (url.pathname === "/api/archive/pause" && method === "POST") {
+          const auth = resolveGuildFromBearerToken(req, store);
+          if ("error" in auth) {
+            return Response.json({ error: auth.error }, { status: auth.status, headers: corsHeaders });
+          }
           const body = (await req.json()) as { jobId: string };
           if (!body.jobId) {
             return Response.json({ error: "jobId is required" }, { status: 400, headers: corsHeaders });
           }
           const job = store.getArchiveJob(body.jobId);
-          if (!job) return Response.json({ error: "Job not found" }, { status: 404, headers: corsHeaders });
+          if (!job || job.guild_id !== auth.guildId) {
+            return Response.json({ error: "Job not found" }, { status: 404, headers: corsHeaders });
+          }
           if (job.status !== "running") {
             return Response.json({ error: `Job is ${job.status}, not running` }, { status: 400, headers: corsHeaders });
           }
@@ -555,6 +580,10 @@ async function main(): Promise<void> {
 
         // Route: POST /api/archive/resume — resume a paused job
         if (url.pathname === "/api/archive/resume" && method === "POST") {
+          const auth = resolveGuildFromBearerToken(req, store);
+          if ("error" in auth) {
+            return Response.json({ error: auth.error }, { status: auth.status, headers: corsHeaders });
+          }
           if (!discordClient) return Response.json({ error: "Discord not connected" }, { status: 503, headers: corsHeaders });
 
           const body = (await req.json()) as {
@@ -566,7 +595,9 @@ async function main(): Promise<void> {
             return Response.json({ error: "jobId is required" }, { status: 400, headers: corsHeaders });
           }
           const job = store.getArchiveJob(body.jobId);
-          if (!job) return Response.json({ error: "Job not found" }, { status: 404, headers: corsHeaders });
+          if (!job || job.guild_id !== auth.guildId) {
+            return Response.json({ error: "Job not found" }, { status: 404, headers: corsHeaders });
+          }
           if (job.status !== "paused") {
             return Response.json({ error: `Job is ${job.status}, not paused` }, { status: 400, headers: corsHeaders });
           }
@@ -637,6 +668,26 @@ async function main(): Promise<void> {
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+/**
+ * Extract guild ID from a Bearer token in the Authorization header.
+ * Returns the guild ID if the token is valid, null otherwise.
+ */
+function resolveGuildFromBearerToken(
+  req: Request,
+  store: Store
+): { guildId: string } | { error: string; status: number } {
+  const authHeader = req.headers.get("authorization");
+  if (!authHeader?.startsWith("Bearer ")) {
+    return { error: "Authorization header with Bearer token required", status: 401 };
+  }
+  const token = authHeader.slice(7);
+  const link = store.getServerLinkByToken(token);
+  if (!link) {
+    return { error: "Invalid API token", status: 401 };
+  }
+  return { guildId: link.discord_guild_id };
 }
 
 /** Clone a Response with extra headers appended */

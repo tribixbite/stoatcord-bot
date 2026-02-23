@@ -12,6 +12,7 @@ export const SCHEMA_SQL = `
     linked_by_discord_user TEXT,
     linked_by_stoat_user TEXT,
     auth_method TEXT,
+    api_token TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
   );
 
@@ -177,6 +178,13 @@ export const MIGRATIONS_V5: string[] = [
 ];
 
 /**
+ * V6 migration: add per-guild API token to server_links for scoped API auth.
+ */
+export const MIGRATIONS_V6: string[] = [
+  "ALTER TABLE server_links ADD COLUMN api_token TEXT",
+];
+
+/**
  * V4 migration: add outage recovery tracking to channel_links.
  */
 export const MIGRATIONS_V4: string[] = [
@@ -222,6 +230,7 @@ export interface ServerLinkRow {
   linked_by_discord_user: string | null;
   linked_by_stoat_user: string | null;
   auth_method: string | null;
+  api_token: string | null;
   created_at: number;
 }
 

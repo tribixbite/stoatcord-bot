@@ -100,6 +100,18 @@ export const commands: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setName("token")
+    .setDescription("View or regenerate this guild's API token for the HTTP archive API")
+    .addBooleanOption((opt) =>
+      opt
+        .setName("regenerate")
+        .setDescription("Generate a new token (invalidates the old one)")
+        .setRequired(false)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .toJSON(),
+
+  new SlashCommandBuilder()
     .setName("archive")
     .setDescription("Discord message history archive/import system")
     .addSubcommand((sub) =>

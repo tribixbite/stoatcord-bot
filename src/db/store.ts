@@ -7,6 +7,7 @@ import {
   MIGRATIONS_V3,
   MIGRATIONS_V4,
   MIGRATIONS_V5,
+  MIGRATIONS_V6,
   type ServerLinkRow,
   type ChannelLinkRow,
   type RoleLinkRow,
@@ -18,7 +19,7 @@ import {
   type ArchiveMessageRow,
 } from "./schema.ts";
 
-const CURRENT_SCHEMA_VERSION = 5;
+const CURRENT_SCHEMA_VERSION = 6;
 
 export class Store {
   private db: Database;
@@ -65,6 +66,10 @@ export class Store {
       this.runMigrationBatch(MIGRATIONS_V5);
     }
 
+    if (currentVersion < 6) {
+      this.runMigrationBatch(MIGRATIONS_V6);
+    }
+
     this.db
       .query("INSERT OR REPLACE INTO schema_version (version) VALUES (?)")
       .run(CURRENT_SCHEMA_VERSION);
@@ -98,14 +103,18 @@ export class Store {
     authMethod: "new_server" | "claim_code" | "live_approval",
     discordUserId?: string,
     stoatUserId?: string
-  ): void {
+  ): string {
+    // Preserve existing token on re-link, generate if new
+    const existing = this.getServerLink(discordGuildId);
+    const token = existing?.api_token ?? generateApiToken();
     this.db
       .query(
         `INSERT OR REPLACE INTO server_links
-         (discord_guild_id, stoat_server_id, auth_method, linked_by_discord_user, linked_by_stoat_user)
-         VALUES (?, ?, ?, ?, ?)`
+         (discord_guild_id, stoat_server_id, auth_method, linked_by_discord_user, linked_by_stoat_user, api_token)
+         VALUES (?, ?, ?, ?, ?, ?)`
       )
-      .run(discordGuildId, stoatServerId, authMethod, discordUserId ?? null, stoatUserId ?? null);
+      .run(discordGuildId, stoatServerId, authMethod, discordUserId ?? null, stoatUserId ?? null, token);
+    return token;
   }
 
   getServerLink(discordGuildId: string): ServerLinkRow | null {
@@ -132,6 +141,44 @@ export class Store {
         )
         .get(stoatServerId) ?? null
     );
+  }
+
+  /** Look up a server link by its API token. Returns null if no match. */
+  getServerLinkByToken(token: string): ServerLinkRow | null {
+    return (
+      this.db
+        .query<ServerLinkRow, [string]>(
+          "SELECT * FROM server_links WHERE api_token = ?"
+        )
+        .get(token) ?? null
+    );
+  }
+
+  /** Regenerate the API token for a guild. Returns the new token. */
+  regenerateGuildToken(discordGuildId: string): string | null {
+    const existing = this.getServerLink(discordGuildId);
+    if (!existing) return null;
+    const token = generateApiToken();
+    this.db
+      .query("UPDATE server_links SET api_token = ? WHERE discord_guild_id = ?")
+      .run(token, discordGuildId);
+    return token;
+  }
+
+  /** Backfill API tokens for any server links that don't have one */
+  backfillApiTokens(): number {
+    const rows = this.db
+      .query<ServerLinkRow, []>(
+        "SELECT * FROM server_links WHERE api_token IS NULL"
+      )
+      .all();
+    for (const row of rows) {
+      const token = generateApiToken();
+      this.db
+        .query("UPDATE server_links SET api_token = ? WHERE discord_guild_id = ?")
+        .run(token, row.discord_guild_id);
+    }
+    return rows.length;
   }
 
   // --- Channel Links ---
@@ -696,4 +743,13 @@ function generateCode(): string {
     code += chars[randomBytes[i]! % chars.length];
   }
   return code;
+}
+
+/** Generate a 32-char hex API token for per-guild API authentication */
+function generateApiToken(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }

@@ -56,6 +56,10 @@ export function registerDiscordEvents(
         case "archive":
           await handleArchive(interaction, store, stoatClient, client);
           break;
+
+        case "token":
+          await handleToken(interaction, store);
+          break;
       }
     } catch (err) {
       console.error(
@@ -368,6 +372,55 @@ async function handleStatus(
     .setTimestamp();
 
   await interaction.reply({ embeds: [embed] });
+}
+
+/** /token — view or regenerate this guild's API token */
+async function handleToken(
+  interaction: ChatInputCommandInteraction,
+  store: Store
+): Promise<void> {
+  const guildId = interaction.guildId;
+  if (!guildId) {
+    await interaction.reply({ content: "This command can only be used in a server.", ephemeral: true });
+    return;
+  }
+
+  const serverLink = store.getServerLink(guildId);
+  if (!serverLink) {
+    await interaction.reply({
+      content: "This server is not linked to a Stoat server. Run `/migrate` first.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const regenerate = interaction.options.getBoolean("regenerate") ?? false;
+  let token = serverLink.api_token;
+
+  if (regenerate) {
+    token = store.regenerateGuildToken(guildId);
+  }
+
+  if (!token) {
+    // Shouldn't happen — backfill should have handled it, but just in case
+    token = store.regenerateGuildToken(guildId);
+  }
+
+  await interaction.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle(regenerate ? "API Token Regenerated" : "API Token")
+        .setColor(regenerate ? 0xe74c3c : 0x4f8a5e)
+        .setDescription(
+          `Use this token in the \`Authorization\` header for archive API calls.\n\n` +
+          `**Token:** \`${token}\`\n\n` +
+          `**Usage:**\n\`\`\`\ncurl -H "Authorization: Bearer ${token}" \\\n  https://api.stoatcord.com/api/archive/status\n\`\`\`` +
+          (regenerate ? "\n\nThe previous token has been invalidated." : "")
+        )
+        .setTimestamp(),
+    ],
+    ephemeral: true,
+  });
 }
 
 // Archive job tracking uses the shared manager from archive/manager.ts
