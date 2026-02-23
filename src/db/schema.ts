@@ -70,12 +70,44 @@ export const SCHEMA_SQL = `
     stoat_user_id TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
   );
+
+  CREATE TABLE IF NOT EXISTS bridge_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    discord_message_id TEXT NOT NULL,
+    stoat_message_id TEXT NOT NULL,
+    discord_channel_id TEXT NOT NULL,
+    stoat_channel_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_bridge_discord ON bridge_messages(discord_message_id);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_bridge_stoat ON bridge_messages(stoat_message_id);
+  CREATE INDEX IF NOT EXISTS idx_bridge_created ON bridge_messages(created_at);
 `;
 
 /**
  * Schema migrations for existing databases.
  * Each statement is run in a try/catch — "duplicate column" errors are expected and ignored.
  */
+/**
+ * V3 migration: add bridge_messages table for edit/delete/reaction sync.
+ * Uses CREATE TABLE IF NOT EXISTS so it's idempotent on fresh DBs.
+ */
+export const MIGRATIONS_V3: string[] = [
+  `CREATE TABLE IF NOT EXISTS bridge_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    discord_message_id TEXT NOT NULL,
+    stoat_message_id TEXT NOT NULL,
+    discord_channel_id TEXT NOT NULL,
+    stoat_channel_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_bridge_discord ON bridge_messages(discord_message_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_bridge_stoat ON bridge_messages(stoat_message_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_bridge_created ON bridge_messages(created_at)`,
+];
+
 export const MIGRATIONS_V2: string[] = [
   // server_links: add user tracking
   "ALTER TABLE server_links ADD COLUMN linked_by_discord_user TEXT",
@@ -154,5 +186,16 @@ export interface MigrationLogRow {
   error_message: string | null;
   discord_user_id: string | null;
   stoat_user_id: string | null;
+  created_at: number;
+}
+
+export interface BridgeMessageRow {
+  id: number;
+  discord_message_id: string;
+  stoat_message_id: string;
+  discord_channel_id: string;
+  stoat_channel_id: string;
+  /** "d2s" = Discord-to-Stoat, "s2d" = Stoat-to-Discord */
+  direction: "d2s" | "s2d";
   created_at: number;
 }

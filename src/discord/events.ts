@@ -68,7 +68,7 @@ export function registerDiscordEvents(
     if (!link) return; // not a linked channel
 
     try {
-      await relayDiscordToStoat(message, link.stoat_channel_id, stoatClient);
+      await relayDiscordToStoat(message, link.stoat_channel_id, stoatClient, store);
     } catch (err) {
       console.error("[bridge] Discord→Stoat relay error:", err);
     }

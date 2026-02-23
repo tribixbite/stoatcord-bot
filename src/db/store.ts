@@ -4,15 +4,17 @@ import { Database } from "bun:sqlite";
 import {
   SCHEMA_SQL,
   MIGRATIONS_V2,
+  MIGRATIONS_V3,
   type ServerLinkRow,
   type ChannelLinkRow,
   type RoleLinkRow,
   type ClaimCodeRow,
   type MigrationRequestRow,
   type MigrationLogRow,
+  type BridgeMessageRow,
 } from "./schema.ts";
 
-const CURRENT_SCHEMA_VERSION = 2;
+const CURRENT_SCHEMA_VERSION = 3;
 
 export class Store {
   private db: Database;
@@ -36,7 +38,7 @@ export class Store {
     this.db.close();
   }
 
-  /** Run incremental ALTER TABLE migrations, idempotent (ignores "duplicate column" errors) */
+  /** Run incremental migrations, idempotent (ignores "duplicate column" / "already exists" errors) */
   private runMigrations(): void {
     const row = this.db
       .query<{ version: number }, []>("SELECT version FROM schema_version LIMIT 1")
@@ -44,22 +46,36 @@ export class Store {
     const currentVersion = row?.version ?? 0;
 
     if (currentVersion < 2) {
-      for (const stmt of MIGRATIONS_V2) {
-        try {
-          this.db.run(stmt);
-        } catch (err) {
-          // Only ignore "duplicate column" errors — rethrow anything else
-          if (!String(err).includes("duplicate column name")) {
-            console.error(`[db] Migration failed: ${stmt}`, err);
-            throw err;
-          }
-        }
-      }
+      this.runMigrationBatch(MIGRATIONS_V2);
+    }
+
+    if (currentVersion < 3) {
+      this.runMigrationBatch(MIGRATIONS_V3);
     }
 
     this.db
       .query("INSERT OR REPLACE INTO schema_version (version) VALUES (?)")
       .run(CURRENT_SCHEMA_VERSION);
+  }
+
+  /** Execute a batch of migration statements, ignoring safe errors */
+  private runMigrationBatch(stmts: string[]): void {
+    for (const stmt of stmts) {
+      try {
+        this.db.run(stmt);
+      } catch (err) {
+        const msg = String(err);
+        // Ignore idempotent errors: duplicate column, table/index already exists
+        if (
+          msg.includes("duplicate column name") ||
+          msg.includes("already exists")
+        ) {
+          continue;
+        }
+        console.error(`[db] Migration failed: ${stmt}`, err);
+        throw err;
+      }
+    }
   }
 
   // --- Server Links ---
@@ -386,6 +402,70 @@ export class Store {
         "SELECT * FROM migration_log WHERE guild_id = ? ORDER BY created_at DESC"
       )
       .all(guildId);
+  }
+
+  // --- Bridge Messages ---
+
+  /** Store a bridged message ID pair for edit/delete/reaction sync */
+  storeBridgeMessage(
+    discordMessageId: string,
+    stoatMessageId: string,
+    discordChannelId: string,
+    stoatChannelId: string,
+    direction: "d2s" | "s2d"
+  ): void {
+    this.db
+      .query(
+        `INSERT OR REPLACE INTO bridge_messages
+         (discord_message_id, stoat_message_id, discord_channel_id, stoat_channel_id, direction)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(discordMessageId, stoatMessageId, discordChannelId, stoatChannelId, direction);
+  }
+
+  /** Look up a bridged message by its Discord message ID */
+  getBridgeMessageByDiscordId(discordMessageId: string): BridgeMessageRow | null {
+    return (
+      this.db
+        .query<BridgeMessageRow, [string]>(
+          "SELECT * FROM bridge_messages WHERE discord_message_id = ?"
+        )
+        .get(discordMessageId) ?? null
+    );
+  }
+
+  /** Look up a bridged message by its Stoat message ID */
+  getBridgeMessageByStoatId(stoatMessageId: string): BridgeMessageRow | null {
+    return (
+      this.db
+        .query<BridgeMessageRow, [string]>(
+          "SELECT * FROM bridge_messages WHERE stoat_message_id = ?"
+        )
+        .get(stoatMessageId) ?? null
+    );
+  }
+
+  /** Remove a bridge message mapping (after deletion) */
+  deleteBridgeMessage(discordMessageId: string): void {
+    this.db
+      .query("DELETE FROM bridge_messages WHERE discord_message_id = ?")
+      .run(discordMessageId);
+  }
+
+  /** Remove a bridge message mapping by Stoat ID */
+  deleteBridgeMessageByStoatId(stoatMessageId: string): void {
+    this.db
+      .query("DELETE FROM bridge_messages WHERE stoat_message_id = ?")
+      .run(stoatMessageId);
+  }
+
+  /** Clean up old bridge message mappings (default: older than 30 days) */
+  cleanOldBridgeMessages(maxAgeDays = 30): number {
+    const cutoff = Math.floor(Date.now() / 1000) - maxAgeDays * 86_400;
+    const result = this.db
+      .query("DELETE FROM bridge_messages WHERE created_at < ?")
+      .run(cutoff);
+    return (result as { changes: number }).changes ?? 0;
   }
 
   // --- Status / Stats ---

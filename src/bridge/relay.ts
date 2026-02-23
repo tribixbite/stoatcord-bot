@@ -4,15 +4,23 @@ import type { Message as DiscordMessage } from "discord.js";
 import type { StoatClient } from "../stoat/client.ts";
 import type { StoatWebSocket } from "../stoat/websocket.ts";
 import type { Store } from "../db/store.ts";
-import type { BonfireMessageEvent } from "../stoat/types.ts";
-import type { User } from "../stoat/types.ts";
+import type {
+  BonfireMessageEvent,
+  BonfireMessageUpdateEvent,
+  BonfireMessageDeleteEvent,
+  User,
+} from "../stoat/types.ts";
 import {
   discordToRevolt,
   revoltToDiscord,
   truncateForRevolt,
   truncateForDiscord,
 } from "./format.ts";
-import { sendViaWebhook } from "./webhooks.ts";
+import {
+  sendViaWebhook,
+  editViaWebhook,
+  deleteViaWebhook,
+} from "./webhooks.ts";
 
 // Track message IDs we've bridged to prevent echo loops
 const recentBridgedIds = new Set<string>();
@@ -53,11 +61,13 @@ function wasBridged(id: string): boolean {
 /**
  * Relay a Discord message to the linked Stoat channel.
  * Uses masquerade to show the Discord user's name and avatar.
+ * Stores the message ID pair in bridge_messages for edit/delete sync.
  */
 export async function relayDiscordToStoat(
   message: DiscordMessage,
   stoatChannelId: string,
-  stoatClient: StoatClient
+  stoatClient: StoatClient,
+  store: Store
 ): Promise<void> {
   if (!message.content && message.attachments.size === 0) return;
 
@@ -89,6 +99,14 @@ export async function relayDiscordToStoat(
   // Mark as bridged so we don't echo it back
   if (sent._id) {
     markBridged(sent._id);
+    // Store the ID pair for edit/delete/reaction sync
+    store.storeBridgeMessage(
+      message.id,
+      sent._id,
+      message.channelId,
+      stoatChannelId,
+      "d2s"
+    );
   }
 }
 
@@ -151,12 +169,20 @@ export function setupStoatToDiscordRelay(
     }
 
     try {
-      await sendViaWebhook(
+      const discordMsgId = await sendViaWebhook(
         link.discord_webhook_id,
         link.discord_webhook_token,
         username,
         avatarUrl,
         content
+      );
+      // Store the ID pair for edit/delete/reaction sync
+      store.storeBridgeMessage(
+        discordMsgId,
+        event._id,
+        link.discord_channel_id,
+        event.channel,
+        "s2d"
       );
     } catch (err) {
       console.error("[bridge] Stoat→Discord relay error:", err);

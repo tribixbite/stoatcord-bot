@@ -132,6 +132,30 @@ export class StoatClient {
     );
   }
 
+  /** Edit a message's content */
+  async editMessage(
+    channelId: string,
+    messageId: string,
+    content: string
+  ): Promise<Message> {
+    return this.request<Message>(
+      "PATCH",
+      `/channels/${channelId}/messages/${messageId}`,
+      { content }
+    );
+  }
+
+  /** Delete a message */
+  async deleteMessage(
+    channelId: string,
+    messageId: string
+  ): Promise<void> {
+    await this.request<unknown>(
+      "DELETE",
+      `/channels/${channelId}/messages/${messageId}`
+    );
+  }
+
   // --- Roles ---
 
   async createRole(
