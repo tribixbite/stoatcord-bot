@@ -127,6 +127,12 @@ function shouldSendTyping(channelId: string, userId: string): boolean {
   const last = typingDebounce.get(key);
   if (last && now - last < TYPING_DEBOUNCE_MS) return false;
   typingDebounce.set(key, now);
+  // Auto-cleanup after debounce period to prevent unbounded map growth
+  setTimeout(() => {
+    if (typingDebounce.get(key) === now) {
+      typingDebounce.delete(key);
+    }
+  }, TYPING_DEBOUNCE_MS);
   return true;
 }
 
@@ -652,7 +658,8 @@ export async function relayDiscordChannelUpdateToStoat(
     const oldTopic = (oldChannel as import("discord.js").TextChannel).topic;
     const newTopic = (newChannel as import("discord.js").TextChannel).topic;
     if (oldTopic !== newTopic) {
-      editData.description = newTopic ?? "";
+      // Stoat channel descriptions max 1024 chars
+      editData.description = (newTopic ?? "").slice(0, 1024);
     }
   }
 

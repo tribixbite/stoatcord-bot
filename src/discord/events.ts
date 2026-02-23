@@ -13,6 +13,7 @@ import type { StoatClient } from "../stoat/client.ts";
 import { startMigrationWizard, type MigrateMode, type MigrateCommandOptions } from "../migration/wizard.ts";
 import { exportDiscordChannel } from "../archive/export.ts";
 import { importToStoat } from "../archive/import.ts";
+import { registerJob, abortJob, unregisterJob, isJobActive } from "../archive/manager.ts";
 import {
   relayDiscordToStoat,
   relayDiscordEditToStoat,
@@ -369,9 +370,7 @@ async function handleStatus(
   await interaction.reply({ embeds: [embed] });
 }
 
-// --- Archive job tracking ---
-// Active archive jobs with their abort controllers for pause/cancel
-const activeArchiveJobs = new Map<string, AbortController>();
+// Archive job tracking uses the shared manager from archive/manager.ts
 
 /**
  * /archive command handler with subcommands: start, status, pause, resume
@@ -447,8 +446,7 @@ async function handleArchiveStart(
     direction: "export",
   });
 
-  const abortController = new AbortController();
-  activeArchiveJobs.set(jobId, abortController);
+  const exportSignal = registerJob(jobId);
 
   await interaction.editReply({
     embeds: [
@@ -465,12 +463,12 @@ async function handleArchiveStart(
   });
 
   // Run export in background (don't block the interaction)
-  exportDiscordChannel(client, store, jobId, channelId, abortController.signal, (progress) => {
+  exportDiscordChannel(client, store, jobId, channelId, exportSignal, (progress) => {
     if (progress.status === "completed" || progress.status === "failed") {
-      activeArchiveJobs.delete(jobId);
+      unregisterJob(jobId);
     }
-    // Progress updates are tracked in the DB — use /archive status to check
   }).then(async (count) => {
+    unregisterJob(jobId);
     // Export complete — if stoatChannelId provided, start import
     if (stoatChannelId && count > 0) {
       const importJobId = store.createArchiveJob({
@@ -481,8 +479,7 @@ async function handleArchiveStart(
         direction: "import",
       });
 
-      const importAbort = new AbortController();
-      activeArchiveJobs.set(importJobId, importAbort);
+      const importSignal = registerJob(importJobId);
 
       try {
         // Send status update to the channel
@@ -503,20 +500,20 @@ async function handleArchiveStart(
           });
         }
 
-        await importToStoat(stoatClient, store, importJobId, stoatChannelId, importAbort.signal, undefined, {
+        await importToStoat(stoatClient, store, importJobId, stoatChannelId, importSignal, undefined, {
           rehostAttachments,
           reconstructReplies: true,
           preserveEmbeds,
         });
 
-        activeArchiveJobs.delete(importJobId);
+        unregisterJob(importJobId);
       } catch (err) {
-        activeArchiveJobs.delete(importJobId);
+        unregisterJob(importJobId);
         console.error("[archive] Import failed:", err);
       }
     }
   }).catch((err) => {
-    activeArchiveJobs.delete(jobId);
+    unregisterJob(jobId);
     console.error("[archive] Export failed:", err);
   });
 }
@@ -583,8 +580,7 @@ async function handleArchivePause(
     return;
   }
 
-  const controller = activeArchiveJobs.get(jobId);
-  if (!controller) {
+  if (!isJobActive(jobId)) {
     await interaction.reply({
       content: `Job \`${jobId}\` is not actively running in this session.`,
       ephemeral: true,
@@ -592,8 +588,7 @@ async function handleArchivePause(
     return;
   }
 
-  controller.abort();
-  activeArchiveJobs.delete(jobId);
+  abortJob(jobId);
 
   await interaction.reply({
     content: `Archive job \`${jobId}\` has been paused. Use \`/archive resume\` to continue.`,
@@ -640,26 +635,27 @@ async function handleArchiveResume(
 
   await interaction.deferReply();
 
-  const abortController = new AbortController();
-  activeArchiveJobs.set(jobId, abortController);
+  // Capture jobId as const for use in async callbacks
+  const resumeJobId = jobId;
+  const resumeSignal = registerJob(resumeJobId);
 
   await interaction.editReply({
-    content: `Resuming archive ${job.direction} job \`${jobId}\`...`,
+    content: `Resuming archive ${job.direction} job \`${resumeJobId}\`...`,
   });
 
   // Resume in background
   if (job.direction === "export") {
-    exportDiscordChannel(client, store, jobId, job.discord_channel_id, abortController.signal).then(() => {
-      activeArchiveJobs.delete(jobId!);
+    exportDiscordChannel(client, store, resumeJobId, job.discord_channel_id, resumeSignal).then(() => {
+      unregisterJob(resumeJobId);
     }).catch((err) => {
-      activeArchiveJobs.delete(jobId!);
+      unregisterJob(resumeJobId);
       console.error("[archive] Export resume failed:", err);
     });
   } else if (job.direction === "import" && job.stoat_channel_id) {
-    importToStoat(stoatClient, store, jobId, job.stoat_channel_id, abortController.signal).then(() => {
-      activeArchiveJobs.delete(jobId!);
+    importToStoat(stoatClient, store, resumeJobId, job.stoat_channel_id, resumeSignal).then(() => {
+      unregisterJob(resumeJobId);
     }).catch((err) => {
-      activeArchiveJobs.delete(jobId!);
+      unregisterJob(resumeJobId);
       console.error("[archive] Import resume failed:", err);
     });
   }

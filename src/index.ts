@@ -507,6 +507,7 @@ async function main(): Promise<void> {
 
           // Lazy-import archive modules to avoid circular deps at startup
           const { exportDiscordChannel } = await import("./archive/export.ts");
+          const { registerJob: regJob, unregisterJob: unregJob } = await import("./archive/manager.ts");
 
           const jobId = store.createArchiveJob({
             guildId: body.guildId,
@@ -516,8 +517,13 @@ async function main(): Promise<void> {
             direction: "export",
           });
 
+          const signal = regJob(jobId);
+
           // Run export in background
-          exportDiscordChannel(discordClient, store, jobId, body.discordChannelId).catch((err) => {
+          exportDiscordChannel(discordClient, store, jobId, body.discordChannelId, signal).then(() => {
+            unregJob(jobId);
+          }).catch((err) => {
+            unregJob(jobId);
             console.error("[archive-api] Export failed:", err);
           });
 
@@ -538,7 +544,9 @@ async function main(): Promise<void> {
           if (job.status !== "running") {
             return Response.json({ error: `Job is ${job.status}, not running` }, { status: 400, headers: corsHeaders });
           }
-          // Mark as paused — the running process checks store status
+          // Abort the running process via shared manager and update DB
+          const { abortJob: doAbort } = await import("./archive/manager.ts");
+          doAbort(body.jobId);
           store.updateArchiveJobStatus(body.jobId, "paused", {
             processedMessages: job.processed_messages,
           });
@@ -563,18 +571,28 @@ async function main(): Promise<void> {
             return Response.json({ error: `Job is ${job.status}, not paused` }, { status: 400, headers: corsHeaders });
           }
 
+          const { registerJob: regJob2, unregisterJob: unregJob2 } = await import("./archive/manager.ts");
+
           if (job.direction === "export") {
             const { exportDiscordChannel } = await import("./archive/export.ts");
-            exportDiscordChannel(discordClient, store, body.jobId, job.discord_channel_id).catch((err) => {
+            const signal = regJob2(body.jobId);
+            exportDiscordChannel(discordClient, store, body.jobId, job.discord_channel_id, signal).then(() => {
+              unregJob2(body.jobId);
+            }).catch((err) => {
+              unregJob2(body.jobId);
               console.error("[archive-api] Export resume failed:", err);
             });
           } else if (job.direction === "import" && job.stoat_channel_id) {
             const { importToStoat } = await import("./archive/import.ts");
-            importToStoat(stoatClient, store, body.jobId, job.stoat_channel_id, undefined, undefined, {
+            const signal = regJob2(body.jobId);
+            importToStoat(stoatClient, store, body.jobId, job.stoat_channel_id, signal, undefined, {
               rehostAttachments: body.rehostAttachments ?? false,
               reconstructReplies: true,
               preserveEmbeds: body.preserveEmbeds ?? false,
+            }).then(() => {
+              unregJob2(body.jobId);
             }).catch((err) => {
+              unregJob2(body.jobId);
               console.error("[archive-api] Import resume failed:", err);
             });
           }
