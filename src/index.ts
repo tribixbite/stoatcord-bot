@@ -49,11 +49,15 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Startup cleanup — expire stale codes and pending migration requests
+  // Startup cleanup — expire stale codes, pending requests, and old bridge mappings
   store.cleanExpiredCodes();
   const expiredReqs = store.cleanExpiredRequests();
   if (expiredReqs > 0) {
     console.log(`[db] Cleaned ${expiredReqs} expired migration request(s)`);
+  }
+  const prunedBridge = store.cleanOldBridgeMessages();
+  if (prunedBridge > 0) {
+    console.log(`[db] Pruned ${prunedBridge} old bridge message mapping(s)`);
   }
 
   // Connect Stoat WebSocket for realtime events
