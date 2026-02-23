@@ -6,6 +6,7 @@ import {
   MIGRATIONS_V2,
   MIGRATIONS_V3,
   MIGRATIONS_V4,
+  MIGRATIONS_V5,
   type ServerLinkRow,
   type ChannelLinkRow,
   type RoleLinkRow,
@@ -13,9 +14,11 @@ import {
   type MigrationRequestRow,
   type MigrationLogRow,
   type BridgeMessageRow,
+  type ArchiveJobRow,
+  type ArchiveMessageRow,
 } from "./schema.ts";
 
-const CURRENT_SCHEMA_VERSION = 4;
+const CURRENT_SCHEMA_VERSION = 5;
 
 export class Store {
   private db: Database;
@@ -56,6 +59,10 @@ export class Store {
 
     if (currentVersion < 4) {
       this.runMigrationBatch(MIGRATIONS_V4);
+    }
+
+    if (currentVersion < 5) {
+      this.runMigrationBatch(MIGRATIONS_V5);
     }
 
     this.db
@@ -506,6 +513,163 @@ export class Store {
       )
       .get();
     return row?.count ?? 0;
+  }
+
+  // --- Archive Jobs ---
+
+  createArchiveJob(job: {
+    id: string;
+    guildId: string;
+    discordChannelId: string;
+    discordChannelName?: string;
+    stoatChannelId?: string;
+    direction: "export" | "import";
+  }): void {
+    this.db
+      .query(
+        `INSERT INTO archive_jobs (id, guild_id, discord_channel_id, discord_channel_name, stoat_channel_id, direction)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        job.id, job.guildId, job.discordChannelId,
+        job.discordChannelName ?? null, job.stoatChannelId ?? null, job.direction
+      );
+  }
+
+  getArchiveJob(jobId: string): ArchiveJobRow | null {
+    return (
+      this.db
+        .query<ArchiveJobRow, [string]>("SELECT * FROM archive_jobs WHERE id = ?")
+        .get(jobId) ?? null
+    );
+  }
+
+  /** Get all jobs for a guild, most recent first */
+  getArchiveJobsForGuild(guildId: string): ArchiveJobRow[] {
+    return this.db
+      .query<ArchiveJobRow, [string]>(
+        "SELECT * FROM archive_jobs WHERE guild_id = ? ORDER BY created_at DESC"
+      )
+      .all(guildId);
+  }
+
+  /** Get the active (running/pending) export job for a channel, if any */
+  getActiveExportJob(discordChannelId: string): ArchiveJobRow | null {
+    return (
+      this.db
+        .query<ArchiveJobRow, [string]>(
+          "SELECT * FROM archive_jobs WHERE discord_channel_id = ? AND direction = 'export' AND status IN ('pending', 'running', 'paused') LIMIT 1"
+        )
+        .get(discordChannelId) ?? null
+    );
+  }
+
+  updateArchiveJobStatus(
+    jobId: string,
+    status: "running" | "paused" | "completed" | "failed",
+    extra?: { error?: string; totalMessages?: number; processedMessages?: number; lastMessageId?: string }
+  ): void {
+    const sets: string[] = ["status = ?"];
+    const params: (string | number | null)[] = [status];
+
+    if (status === "running") {
+      sets.push("started_at = COALESCE(started_at, unixepoch())");
+    }
+    if (status === "completed" || status === "failed") {
+      sets.push("completed_at = unixepoch()");
+    }
+    if (extra?.error !== undefined) {
+      sets.push("error = ?");
+      params.push(extra.error);
+    }
+    if (extra?.totalMessages !== undefined) {
+      sets.push("total_messages = ?");
+      params.push(extra.totalMessages);
+    }
+    if (extra?.processedMessages !== undefined) {
+      sets.push("processed_messages = ?");
+      params.push(extra.processedMessages);
+    }
+    if (extra?.lastMessageId !== undefined) {
+      sets.push("last_message_id = ?");
+      params.push(extra.lastMessageId);
+    }
+
+    params.push(jobId);
+    this.db.query(`UPDATE archive_jobs SET ${sets.join(", ")} WHERE id = ?`).run(...params);
+  }
+
+  // --- Archive Messages ---
+
+  /** Store a batch of exported Discord messages. Uses INSERT OR IGNORE for idempotent resumes. */
+  storeArchiveMessages(
+    messages: Array<{
+      jobId: string;
+      discordMessageId: string;
+      discordChannelId: string;
+      authorId: string;
+      authorName: string;
+      authorAvatarUrl?: string;
+      content?: string;
+      timestamp: string;
+      editedTimestamp?: string;
+      replyToId?: string;
+      attachmentsJson?: string;
+      embedsJson?: string;
+    }>
+  ): number {
+    const stmt = this.db.query(
+      `INSERT OR IGNORE INTO archive_messages
+       (job_id, discord_message_id, discord_channel_id, author_id, author_name, author_avatar_url,
+        content, timestamp, edited_timestamp, reply_to_id, attachments_json, embeds_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+
+    let inserted = 0;
+    const tx = this.db.transaction(() => {
+      for (const m of messages) {
+        const result = stmt.run(
+          m.jobId, m.discordMessageId, m.discordChannelId, m.authorId, m.authorName,
+          m.authorAvatarUrl ?? null, m.content ?? null, m.timestamp,
+          m.editedTimestamp ?? null, m.replyToId ?? null,
+          m.attachmentsJson ?? null, m.embedsJson ?? null
+        );
+        inserted += (result as { changes: number }).changes;
+      }
+    });
+    tx();
+    return inserted;
+  }
+
+  /** Get un-imported archive messages for a job, ordered by timestamp (oldest first) */
+  getUnimportedMessages(jobId: string, limit = 50): ArchiveMessageRow[] {
+    return this.db
+      .query<ArchiveMessageRow, [string, number]>(
+        "SELECT * FROM archive_messages WHERE job_id = ? AND stoat_message_id IS NULL ORDER BY timestamp ASC LIMIT ?"
+      )
+      .all(jobId, limit);
+  }
+
+  /** Mark an archive message as imported */
+  markArchiveMessageImported(id: number, stoatMessageId: string): void {
+    this.db
+      .query("UPDATE archive_messages SET stoat_message_id = ?, imported_at = unixepoch() WHERE id = ?")
+      .run(stoatMessageId, id);
+  }
+
+  /** Count total and imported messages for a job */
+  getArchiveMessageCounts(jobId: string): { total: number; imported: number } {
+    const total = this.db
+      .query<{ count: number }, [string]>(
+        "SELECT COUNT(*) as count FROM archive_messages WHERE job_id = ?"
+      )
+      .get(jobId)?.count ?? 0;
+    const imported = this.db
+      .query<{ count: number }, [string]>(
+        "SELECT COUNT(*) as count FROM archive_messages WHERE job_id = ? AND stoat_message_id IS NOT NULL"
+      )
+      .get(jobId)?.count ?? 0;
+    return { total, imported };
   }
 }
 

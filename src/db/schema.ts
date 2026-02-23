@@ -86,6 +86,44 @@ export const SCHEMA_SQL = `
   CREATE UNIQUE INDEX IF NOT EXISTS idx_bridge_discord ON bridge_messages(discord_message_id);
   CREATE UNIQUE INDEX IF NOT EXISTS idx_bridge_stoat ON bridge_messages(stoat_message_id);
   CREATE INDEX IF NOT EXISTS idx_bridge_created ON bridge_messages(created_at);
+
+  CREATE TABLE IF NOT EXISTS archive_jobs (
+    id TEXT PRIMARY KEY,
+    guild_id TEXT NOT NULL,
+    discord_channel_id TEXT NOT NULL,
+    discord_channel_name TEXT,
+    stoat_channel_id TEXT,
+    direction TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    total_messages INTEGER DEFAULT 0,
+    processed_messages INTEGER DEFAULT 0,
+    last_message_id TEXT,
+    started_at INTEGER,
+    completed_at INTEGER,
+    error TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+
+  CREATE TABLE IF NOT EXISTS archive_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL REFERENCES archive_jobs(id),
+    discord_message_id TEXT NOT NULL,
+    discord_channel_id TEXT NOT NULL,
+    author_id TEXT NOT NULL,
+    author_name TEXT NOT NULL,
+    author_avatar_url TEXT,
+    content TEXT,
+    timestamp TEXT NOT NULL,
+    edited_timestamp TEXT,
+    reply_to_id TEXT,
+    attachments_json TEXT,
+    embeds_json TEXT,
+    stoat_message_id TEXT,
+    imported_at INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+  CREATE INDEX IF NOT EXISTS idx_archive_msgs_job ON archive_messages(job_id);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_archive_msgs_unique ON archive_messages(job_id, discord_message_id);
 `;
 
 /**
@@ -96,6 +134,48 @@ export const SCHEMA_SQL = `
  * V3 migration: add bridge_messages table for edit/delete/reaction sync.
  * Uses CREATE TABLE IF NOT EXISTS so it's idempotent on fresh DBs.
  */
+/**
+ * V5 migration: archive system tables for Discord message history export/import.
+ */
+export const MIGRATIONS_V5: string[] = [
+  `CREATE TABLE IF NOT EXISTS archive_jobs (
+    id TEXT PRIMARY KEY,
+    guild_id TEXT NOT NULL,
+    discord_channel_id TEXT NOT NULL,
+    discord_channel_name TEXT,
+    stoat_channel_id TEXT,
+    direction TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    total_messages INTEGER DEFAULT 0,
+    processed_messages INTEGER DEFAULT 0,
+    last_message_id TEXT,
+    started_at INTEGER,
+    completed_at INTEGER,
+    error TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+  `CREATE TABLE IF NOT EXISTS archive_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL REFERENCES archive_jobs(id),
+    discord_message_id TEXT NOT NULL,
+    discord_channel_id TEXT NOT NULL,
+    author_id TEXT NOT NULL,
+    author_name TEXT NOT NULL,
+    author_avatar_url TEXT,
+    content TEXT,
+    timestamp TEXT NOT NULL,
+    edited_timestamp TEXT,
+    reply_to_id TEXT,
+    attachments_json TEXT,
+    embeds_json TEXT,
+    stoat_message_id TEXT,
+    imported_at INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_archive_msgs_job ON archive_messages(job_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_archive_msgs_unique ON archive_messages(job_id, discord_message_id)`,
+];
+
 /**
  * V4 migration: add outage recovery tracking to channel_links.
  */
@@ -212,5 +292,41 @@ export interface BridgeMessageRow {
   stoat_channel_id: string;
   /** "d2s" = Discord-to-Stoat, "s2d" = Stoat-to-Discord */
   direction: "d2s" | "s2d";
+  created_at: number;
+}
+
+export interface ArchiveJobRow {
+  id: string;
+  guild_id: string;
+  discord_channel_id: string;
+  discord_channel_name: string | null;
+  stoat_channel_id: string | null;
+  direction: "export" | "import";
+  status: "pending" | "running" | "paused" | "completed" | "failed";
+  total_messages: number;
+  processed_messages: number;
+  last_message_id: string | null;
+  started_at: number | null;
+  completed_at: number | null;
+  error: string | null;
+  created_at: number;
+}
+
+export interface ArchiveMessageRow {
+  id: number;
+  job_id: string;
+  discord_message_id: string;
+  discord_channel_id: string;
+  author_id: string;
+  author_name: string;
+  author_avatar_url: string | null;
+  content: string | null;
+  timestamp: string;
+  edited_timestamp: string | null;
+  reply_to_id: string | null;
+  attachments_json: string | null;
+  embeds_json: string | null;
+  stoat_message_id: string | null;
+  imported_at: number | null;
   created_at: number;
 }
