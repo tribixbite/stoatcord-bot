@@ -73,61 +73,92 @@ export function mapDiscordRoles(guild: Guild): RoleMapping[] {
 }
 
 /**
- * Map Discord permission bitfield to Revolt's { a: allowed, d: denied } format.
- * Discord only has "allowed" permissions. Revolt uses allow/deny pairs.
+ * Convert a Discord PermissionsBitField to a Revolt permission integer.
+ * Shared by role-level and channel-override mapping.
+ */
+function discordToRevoltBits(
+  discordPerms: Readonly<PermissionsBitField>
+): number {
+  let bits = 0;
+
+  // Core permission mappings: Discord → Revolt
+  if (discordPerms.has("ManageChannels"))
+    bits |= Number(PermissionBit.ManageChannel);
+  if (discordPerms.has("ManageGuild"))
+    bits |= Number(PermissionBit.ManageServer);
+  if (discordPerms.has("ManageRoles")) {
+    bits |= Number(PermissionBit.ManageRole);
+    bits |= Number(PermissionBit.ManagePermissions);
+    bits |= Number(PermissionBit.AssignRoles);
+  }
+  if (discordPerms.has("KickMembers"))
+    bits |= Number(PermissionBit.KickMembers);
+  if (discordPerms.has("BanMembers"))
+    bits |= Number(PermissionBit.BanMembers);
+  if (discordPerms.has("ModerateMembers"))
+    bits |= Number(PermissionBit.TimeoutMembers);
+  if (discordPerms.has("ChangeNickname"))
+    bits |= Number(PermissionBit.ChangeNickname);
+  if (discordPerms.has("ManageNicknames")) {
+    bits |= Number(PermissionBit.ManageNicknames);
+    bits |= Number(PermissionBit.ChangeAvatar);
+    bits |= Number(PermissionBit.RemoveAvatars);
+  }
+  if (discordPerms.has("ViewChannel"))
+    bits |= Number(PermissionBit.ViewChannel);
+  if (discordPerms.has("ReadMessageHistory"))
+    bits |= Number(PermissionBit.ReadMessageHistory);
+  if (discordPerms.has("SendMessages"))
+    bits |= Number(PermissionBit.SendMessage);
+  if (discordPerms.has("ManageMessages"))
+    bits |= Number(PermissionBit.ManageMessages);
+  if (discordPerms.has("ManageWebhooks")) {
+    bits |= Number(PermissionBit.ManageWebhooks);
+    bits |= Number(PermissionBit.Masquerade);
+  }
+  if (discordPerms.has("CreateInstantInvite"))
+    bits |= Number(PermissionBit.InviteOthers);
+  if (discordPerms.has("EmbedLinks"))
+    bits |= Number(PermissionBit.SendEmbeds);
+  if (discordPerms.has("AttachFiles"))
+    bits |= Number(PermissionBit.UploadFiles);
+  if (discordPerms.has("AddReactions"))
+    bits |= Number(PermissionBit.React);
+  if (discordPerms.has("Connect"))
+    bits |= Number(PermissionBit.Connect);
+  if (discordPerms.has("Speak"))
+    bits |= Number(PermissionBit.Speak);
+  if (discordPerms.has("Stream"))
+    bits |= Number(PermissionBit.Video);
+  if (discordPerms.has("MuteMembers"))
+    bits |= Number(PermissionBit.MuteMembers);
+  if (discordPerms.has("DeafenMembers"))
+    bits |= Number(PermissionBit.DeafenMembers);
+  if (discordPerms.has("MoveMembers"))
+    bits |= Number(PermissionBit.MoveMembers);
+  if (discordPerms.has("ManageGuildExpressions"))
+    bits |= Number(PermissionBit.ManageCustomisation);
+
+  return bits;
+}
+
+/**
+ * Map Discord role permissions to Revolt's { a: allowed, d: denied } format.
+ * Discord roles only have "allowed" permissions — denied is always 0.
  */
 export function mapPermissions(
   discordPerms: Readonly<PermissionsBitField>
 ): PermissionsPair {
-  let allowed = 0;
+  return { a: discordToRevoltBits(discordPerms), d: 0 };
+}
 
-  // Map Discord permissions → Revolt equivalents
-  if (discordPerms.has("ManageChannels"))
-    allowed |= Number(PermissionBit.ManageChannel);
-  if (discordPerms.has("ManageGuild"))
-    allowed |= Number(PermissionBit.ManageServer);
-  if (discordPerms.has("ManageRoles"))
-    allowed |= Number(PermissionBit.ManageRole);
-  if (discordPerms.has("KickMembers"))
-    allowed |= Number(PermissionBit.KickMembers);
-  if (discordPerms.has("BanMembers"))
-    allowed |= Number(PermissionBit.BanMembers);
-  if (discordPerms.has("ModerateMembers"))
-    allowed |= Number(PermissionBit.TimeoutMembers);
-  if (discordPerms.has("ChangeNickname"))
-    allowed |= Number(PermissionBit.ChangeNickname);
-  if (discordPerms.has("ManageNicknames"))
-    allowed |= Number(PermissionBit.ManageNicknames);
-  if (discordPerms.has("ViewChannel"))
-    allowed |= Number(PermissionBit.ViewChannel);
-  if (discordPerms.has("ReadMessageHistory"))
-    allowed |= Number(PermissionBit.ReadMessageHistory);
-  if (discordPerms.has("SendMessages"))
-    allowed |= Number(PermissionBit.SendMessage);
-  if (discordPerms.has("ManageMessages"))
-    allowed |= Number(PermissionBit.ManageMessages);
-  if (discordPerms.has("ManageWebhooks"))
-    allowed |= Number(PermissionBit.ManageWebhooks);
-  if (discordPerms.has("CreateInstantInvite"))
-    allowed |= Number(PermissionBit.InviteOthers);
-  if (discordPerms.has("EmbedLinks"))
-    allowed |= Number(PermissionBit.SendEmbeds);
-  if (discordPerms.has("AttachFiles"))
-    allowed |= Number(PermissionBit.UploadFiles);
-  if (discordPerms.has("AddReactions"))
-    allowed |= Number(PermissionBit.React);
-  if (discordPerms.has("Connect"))
-    allowed |= Number(PermissionBit.Connect);
-  if (discordPerms.has("Speak"))
-    allowed |= Number(PermissionBit.Speak);
-  if (discordPerms.has("Stream"))
-    allowed |= Number(PermissionBit.Video);
-  if (discordPerms.has("MuteMembers"))
-    allowed |= Number(PermissionBit.MuteMembers);
-  if (discordPerms.has("DeafenMembers"))
-    allowed |= Number(PermissionBit.DeafenMembers);
-  if (discordPerms.has("MoveMembers"))
-    allowed |= Number(PermissionBit.MoveMembers);
-
-  return { a: allowed, d: 0 };
+/**
+ * Map Discord channel permission overrides (allow + deny) to Revolt format.
+ * Channel overrides use both allow and deny bitfields, unlike roles.
+ */
+export function mapChannelOverridePermissions(
+  allow: Readonly<PermissionsBitField>,
+  deny: Readonly<PermissionsBitField>
+): PermissionsPair {
+  return { a: discordToRevoltBits(allow), d: discordToRevoltBits(deny) };
 }

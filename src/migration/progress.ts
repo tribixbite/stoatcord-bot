@@ -4,10 +4,12 @@
  * mid-flight cancellation via AbortSignal, and emoji/media migration.
  */
 
+import { OverwriteType } from "discord.js";
 import { sleep } from "../util.ts";
 import type { StoatClient } from "../stoat/client.ts";
 import type { Store } from "../db/store.ts";
 import type { ChannelMapping } from "./channels.ts";
+import { mapChannelOverridePermissions } from "./roles.ts";
 import type { RoleMapping } from "./roles.ts";
 import type { Category, Channel, Role, Server } from "../stoat/types.ts";
 
@@ -94,8 +96,8 @@ export async function executeMigration(
   const selectedChannels = channels.filter((c) => c.selected);
   const selectedRoles = roles.filter((r) => r.selected);
 
-  // +1 for categories, +1 for server properties
-  let totalSteps = selectedRoles.length + selectedChannels.length + 2;
+  // +1 for channel permission overrides, +1 for categories, +1 for server properties
+  let totalSteps = selectedRoles.length + selectedChannels.length + 3;
   if (includeEmoji && guild) totalSteps += guild.emojis.cache.size;
   if (includeMedia && guild) totalSteps += 2; // icon + banner
 
@@ -320,6 +322,91 @@ export async function executeMigration(
     if (!dryRun) await sleep(CHANNEL_DELAY);
   }
 
+  // --- Phase 2.5: Apply per-channel permission overrides ---
+  checkAbort(signal);
+  progress.currentAction = dryRun
+    ? "[DRY RUN] Would apply channel permission overrides..."
+    : "Applying channel permission overrides...";
+  if (onProgress) await onProgress(progress);
+
+  let overrideCount = 0;
+  for (const ch of selectedChannels) {
+    const stoatChannelId = channelIdMap.get(ch.discordId);
+    if (!stoatChannelId) continue;
+
+    const overwrites = ch.discordChannel.permissionOverwrites?.cache;
+    if (!overwrites || overwrites.size === 0) continue;
+
+    for (const [, overwrite] of overwrites) {
+      // Revolt only supports role-based overrides, not member-specific
+      if (overwrite.type === OverwriteType.Member) {
+        progress.warnings.push(
+          `Skipping member-specific permission override on #${ch.stoatName}`
+        );
+        continue;
+      }
+
+      // @everyone role: use the default permissions endpoint
+      if (overwrite.id === ch.discordChannel.guild.id) {
+        const perms = mapChannelOverridePermissions(overwrite.allow, overwrite.deny);
+        if (perms.a === 0 && perms.d === 0) continue;
+
+        if (dryRun) {
+          progress.dryRunLog.push(
+            `SET default permission override on #${ch.stoatName} (allow=${perms.a}, deny=${perms.d})`
+          );
+        } else {
+          try {
+            await stoatClient.setChannelDefaultPermissions(stoatChannelId, perms);
+            overrideCount++;
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            progress.errors.push({
+              action: `Default perms on #${ch.stoatName}`,
+              error: msg,
+            });
+          }
+        }
+        continue;
+      }
+
+      // Role-specific override: map Discord role ID → Stoat role ID
+      const stoatRoleId = roleIdMap.get(overwrite.id);
+      if (!stoatRoleId) {
+        // Role wasn't migrated (maybe it was deselected or is a bot role)
+        continue;
+      }
+
+      const perms = mapChannelOverridePermissions(overwrite.allow, overwrite.deny);
+      if (perms.a === 0 && perms.d === 0) continue;
+
+      if (dryRun) {
+        progress.dryRunLog.push(
+          `SET role permission override on #${ch.stoatName} for role ${overwrite.id} (allow=${perms.a}, deny=${perms.d})`
+        );
+      } else {
+        try {
+          await stoatClient.setChannelRolePermissions(stoatChannelId, stoatRoleId, perms);
+          overrideCount++;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          progress.errors.push({
+            action: `Role perms on #${ch.stoatName}`,
+            error: msg,
+          });
+        }
+      }
+    }
+  }
+
+  if (!dryRun && overrideCount > 0) {
+    store.logMigration(
+      guildId, "channel_perms_set", null, stoatServerId, "success",
+      `Applied ${overrideCount} permission override(s)`, discordUserId, stoatUserId
+    );
+  }
+  progress.completedSteps++;
+
   // --- Phase 3: Set categories ---
   checkAbort(signal);
   progress.currentAction = dryRun ? "[DRY RUN] Would organize categories..." : "Organizing categories...";
@@ -383,6 +470,24 @@ export async function executeMigration(
       const serverEditData: Record<string, unknown> = {};
       if (guild.description && guild.description !== server?.description) {
         serverEditData.description = guild.description;
+      }
+
+      // Map Discord system message channel → Stoat system_messages
+      if (guild.systemChannelId) {
+        const stoatSysChannel = channelIdMap.get(guild.systemChannelId);
+        if (stoatSysChannel) {
+          serverEditData.system_messages = {
+            user_joined: stoatSysChannel,
+            user_left: stoatSysChannel,
+            user_kicked: stoatSysChannel,
+            user_banned: stoatSysChannel,
+          };
+          if (dryRun) {
+            progress.dryRunLog.push(
+              `SET system messages channel → #${guild.systemChannel?.name ?? guild.systemChannelId}`
+            );
+          }
+        }
       }
 
       if (Object.keys(serverEditData).length > 0) {
