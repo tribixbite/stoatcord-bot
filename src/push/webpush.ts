@@ -1,8 +1,7 @@
 /** WebPush sender for UnifiedPush endpoints — RFC 8291 encryption + VAPID */
 
-// TODO: web-push package integration — currently stubbed for when UnifiedPush
-// is enabled. The FCM direct path is the primary delivery mechanism.
-// When web-push is added: bun add web-push && implement sendWebPushNotification
+// WebPush via web-push package (optional dependency — FCM is the primary path).
+// Install with: bun add web-push
 
 export interface VapidKeys {
   publicKey: string;
