@@ -45,10 +45,19 @@ export async function exportDiscordChannel(
   signal?: AbortSignal,
   onProgress?: ExportProgressCallback
 ): Promise<number> {
-  const channel = discordClient.channels.cache.get(channelId) as TextChannel | undefined;
+  // Fetch channel (not just cache) for resilience after restarts
+  let channel: TextChannel | undefined;
+  try {
+    const fetched = await discordClient.channels.fetch(channelId);
+    if (fetched?.isTextBased()) {
+      channel = fetched as TextChannel;
+    }
+  } catch {
+    // fetch throws if channel doesn't exist
+  }
   if (!channel) {
-    store.updateArchiveJobStatus(jobId, "failed", { error: "Channel not found in cache" });
-    throw new Error(`Channel ${channelId} not found in Discord client cache`);
+    store.updateArchiveJobStatus(jobId, "failed", { error: "Channel not found or not a text channel" });
+    throw new Error(`Channel ${channelId} not found or not a text channel`);
   }
 
   // Check for existing resume cursor
@@ -94,9 +103,10 @@ export async function exportDiscordChannel(
         break;
       }
 
-      // Convert to storage format
+      // Convert to storage format — skip system messages and webhook messages
+      // (webhook messages are bridge-relayed content that already exists on the other platform)
       const toStore = [...batch.values()]
-        .filter((m) => !m.system) // Skip system messages (join, boost, etc.)
+        .filter((m) => !m.system && !m.webhookId)
         .map((m) => serializeMessage(m, jobId));
 
       if (toStore.length > 0) {

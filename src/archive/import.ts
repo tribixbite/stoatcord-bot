@@ -130,14 +130,9 @@ async function sendArchivedMessage(
   channelId: string,
   msg: ArchiveMessageRow
 ): Promise<string | null> {
-  // Build content with original timestamp header
+  // Build content with original timestamp header (locale-independent)
   const ts = new Date(msg.timestamp);
-  const dateStr = ts.toLocaleDateString("en-US", {
-    year: "numeric", month: "short", day: "numeric",
-  });
-  const timeStr = ts.toLocaleTimeString("en-US", {
-    hour: "2-digit", minute: "2-digit", hour12: true,
-  });
+  const timestampStr = formatTimestamp(ts);
 
   let content = "";
 
@@ -159,7 +154,7 @@ async function sendArchivedMessage(
   }
 
   // Prepend timestamp header
-  content = `*${dateStr} ${timeStr}*\n${content}`.trim();
+  content = `*${timestampStr}*\n${content}`.trim();
   content = truncateForRevolt(content);
 
   if (!content) return null;
@@ -172,4 +167,16 @@ async function sendArchivedMessage(
   });
 
   return sent._id ?? null;
+}
+
+/** Format a Date as "YYYY-MM-DD HH:MM AM/PM" — locale-independent */
+function formatTimestamp(date: Date): string {
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(date.getUTCDate()).padStart(2, "0");
+  let h = date.getUTCHours();
+  const min = String(date.getUTCMinutes()).padStart(2, "0");
+  const ampm = h >= 12 ? "PM" : "AM";
+  h = h % 12 || 12;
+  return `${y}-${m}-${d} ${h}:${min} ${ampm} UTC`;
 }
