@@ -8,6 +8,7 @@ import type {
   BonfireMessageEvent,
   BonfireMessageUpdateEvent,
   BonfireMessageDeleteEvent,
+  SendMessageRequest,
   User,
 } from "../stoat/types.ts";
 import {
@@ -115,12 +116,27 @@ export async function relayDiscordToStoat(
     extension: "png",
   });
 
-  const sent = await stoatClient.sendMessage(stoatChannelId, content, {
+  // Resolve reply chain: if this message replies to another, look up the Stoat counterpart
+  const sendOpts: Partial<Omit<SendMessageRequest, "content">> = {
     masquerade: {
       name: message.author.displayName || message.author.username,
       avatar: avatarUrl,
     },
-  });
+  };
+
+  if (message.reference?.messageId) {
+    const parentMapping = store.getBridgeMessageByDiscordId(message.reference.messageId);
+    if (parentMapping) {
+      // Link as a proper Stoat reply
+      sendOpts.replies = [{ id: parentMapping.stoat_message_id, mention: false }];
+    } else {
+      // Parent not in bridge_messages — prepend a quote-style fallback
+      content = `> *Replying to a message*\n${content}`;
+      content = truncateForRevolt(content);
+    }
+  }
+
+  const sent = await stoatClient.sendMessage(stoatChannelId, content, sendOpts);
 
   // Mark as bridged so we don't echo it back
   if (sent._id) {
@@ -170,6 +186,19 @@ export function setupStoatToDiscordRelay(
       return;
 
     content = revoltToDiscord(content);
+
+    // Handle reply chain: if Stoat message replies to another, prepend a quote
+    // (Webhook messages can't use Discord's message_reference natively)
+    if (event.replies && event.replies.length > 0) {
+      const parentStoatId = event.replies[0]!;
+      const parentMapping = store.getBridgeMessageByStoatId(parentStoatId);
+      if (parentMapping) {
+        // Reference the Discord message in a quote-style prefix
+        content = `> *Replying to [message](https://discord.com/channels/@me/${link.discord_channel_id}/${parentMapping.discord_message_id})*\n${content}`;
+      } else {
+        content = `> *Replying to a message*\n${content}`;
+      }
+    }
 
     // Append Stoat attachment URLs
     if (event.attachments) {
