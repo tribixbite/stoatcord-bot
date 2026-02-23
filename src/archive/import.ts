@@ -194,15 +194,19 @@ async function sendArchivedMessage(
           try {
             const res = await fetch(att.url);
             if (res.ok) {
-              const buffer = new Uint8Array(await res.arrayBuffer());
+              let buffer: Uint8Array | null = new Uint8Array(await res.arrayBuffer());
               if (buffer.length <= MAX_REHOST_SIZE) {
                 const uploaded = await stoatClient.uploadFile(
                   "attachments", buffer, att.name ?? "attachment"
                 );
+                buffer = null; // Release memory immediately
                 autumnIds.push(uploaded.id);
                 result.rehostSuccesses++;
+                // Brief delay between uploads to avoid Autumn rate limits
+                await sleep(500);
                 continue;
               }
+              buffer = null; // Release oversized buffer
             }
           } catch (err) {
             console.warn(`[archive] Attachment re-host failed for ${att.name}:`, err);
