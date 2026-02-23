@@ -21,6 +21,7 @@ import {
   sendViaWebhook,
   editViaWebhook,
   deleteViaWebhook,
+  type WebhookFile,
 } from "./webhooks.ts";
 
 // Track message IDs we've bridged to prevent echo loops
@@ -98,18 +99,41 @@ export async function relayDiscordToStoat(
 ): Promise<void> {
   if (!message.content && message.attachments.size === 0) return;
 
-  // Build content with attachment URLs appended
+  // Build content
   let content = message.content
     ? discordToRevolt(message.content)
     : "";
 
-  // Append attachment URLs (Revolt will auto-embed images/videos)
+  // Re-host Discord attachments to Stoat Autumn CDN
+  const autumnIds: string[] = [];
   for (const attachment of message.attachments.values()) {
-    content += `\n${attachment.url}`;
+    // Skip files over 20MB (Autumn upload limit)
+    if (attachment.size > 20 * 1024 * 1024) {
+      content += `\n${attachment.url}`;
+      continue;
+    }
+    try {
+      const fileData = await fetch(attachment.url);
+      if (!fileData.ok) {
+        content += `\n${attachment.url}`;
+        continue;
+      }
+      const buffer = new Uint8Array(await fileData.arrayBuffer());
+      const uploaded = await stoatClient.uploadFile(
+        "attachments",
+        buffer,
+        attachment.name ?? "attachment"
+      );
+      autumnIds.push(uploaded.id);
+    } catch (err) {
+      // Fallback to URL if upload fails
+      console.warn("[bridge] Attachment re-host failed, using URL fallback:", err);
+      content += `\n${attachment.url}`;
+    }
   }
 
   content = truncateForRevolt(content.trim());
-  if (!content) return;
+  if (!content && autumnIds.length === 0) return;
 
   const avatarUrl = message.author.displayAvatarURL({
     size: 256,
@@ -136,7 +160,12 @@ export async function relayDiscordToStoat(
     }
   }
 
-  const sent = await stoatClient.sendMessage(stoatChannelId, content, sendOpts);
+  // Attach re-hosted files if any
+  if (autumnIds.length > 0) {
+    sendOpts.attachments = autumnIds;
+  }
+
+  const sent = await stoatClient.sendMessage(stoatChannelId, content || " ", sendOpts);
 
   // Mark as bridged so we don't echo it back
   if (sent._id) {
@@ -200,15 +229,31 @@ export function setupStoatToDiscordRelay(
       }
     }
 
-    // Append Stoat attachment URLs
+    // Re-host Stoat attachments to Discord via webhook multipart
+    const webhookFiles: Array<{ data: Uint8Array; name: string }> = [];
     if (event.attachments) {
       for (const att of event.attachments) {
-        content += `\n${stoatCdnUrl}/attachments/${att._id}/${att.filename}`;
+        const attUrl = `${stoatCdnUrl}/attachments/${att._id}/${att.filename}`;
+        try {
+          const res = await fetch(attUrl);
+          if (res.ok) {
+            const buffer = new Uint8Array(await res.arrayBuffer());
+            // Discord webhook max 25MB per file (8MB for free bots, but webhooks allow 25MB)
+            if (buffer.length <= 25 * 1024 * 1024) {
+              webhookFiles.push({ data: buffer, name: att.filename });
+              continue;
+            }
+          }
+        } catch (err) {
+          console.warn("[bridge] Stoat attachment re-host failed:", err);
+        }
+        // Fallback to URL if download/size fails
+        content += `\n${attUrl}`;
       }
     }
 
     content = truncateForDiscord(content.trim());
-    if (!content) return;
+    if (!content && webhookFiles.length === 0) return;
 
     // Resolve user display name and avatar from Stoat API (cached)
     let username = "stoat-user";
@@ -229,7 +274,8 @@ export function setupStoatToDiscordRelay(
         link.discord_webhook_token,
         username,
         avatarUrl,
-        content
+        content || " ",
+        webhookFiles.length > 0 ? webhookFiles : undefined
       );
       // Store the ID pair for edit/delete/reaction sync
       store.storeBridgeMessage(

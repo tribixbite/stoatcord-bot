@@ -27,30 +27,56 @@ export async function ensureWebhook(
   });
 }
 
+/** File attachment for webhook multipart upload */
+export interface WebhookFile {
+  data: Uint8Array;
+  name: string;
+}
+
 /**
  * Send a message via webhook with custom username and avatar.
  * Used for Stoat→Discord bridging to show the Stoat user's identity.
  * Returns the Discord message ID for bridge_messages tracking.
+ * When files are provided, uses multipart/form-data instead of JSON.
  */
 export async function sendViaWebhook(
   webhookId: string,
   webhookToken: string,
   username: string,
   avatarUrl: string | undefined,
-  content: string
+  content: string,
+  files?: WebhookFile[]
 ): Promise<string> {
   // Use ?wait=true to get the created message back (includes ID)
   const url = `https://discord.com/api/v10/webhooks/${webhookId}/${webhookToken}?wait=true`;
-  const body: Record<string, string> = { content, username };
-  if (avatarUrl) {
-    body["avatar_url"] = avatarUrl;
-  }
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  let res: Response;
+
+  if (files && files.length > 0) {
+    // Multipart upload with file attachments
+    const formData = new FormData();
+    const payload: Record<string, unknown> = { content, username };
+    if (avatarUrl) {
+      payload["avatar_url"] = avatarUrl;
+    }
+    formData.append("payload_json", JSON.stringify(payload));
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i]!;
+      formData.append(`files[${i}]`, new Blob([file.data]), file.name);
+    }
+    res = await fetch(url, { method: "POST", body: formData });
+  } else {
+    // Simple JSON body
+    const body: Record<string, string> = { content, username };
+    if (avatarUrl) {
+      body["avatar_url"] = avatarUrl;
+    }
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
