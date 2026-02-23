@@ -330,6 +330,8 @@ export async function executeMigration(
   if (onProgress) await onProgress(progress);
 
   let overrideCount = 0;
+  const channelsWithMemberOverrides = new Set<string>();
+
   for (const ch of selectedChannels) {
     const stoatChannelId = channelIdMap.get(ch.discordId);
     if (!stoatChannelId) continue;
@@ -340,9 +342,7 @@ export async function executeMigration(
     for (const [, overwrite] of overwrites) {
       // Revolt only supports role-based overrides, not member-specific
       if (overwrite.type === OverwriteType.Member) {
-        progress.warnings.push(
-          `Skipping member-specific permission override on #${ch.stoatName}`
-        );
+        channelsWithMemberOverrides.add(ch.stoatName);
         continue;
       }
 
@@ -359,6 +359,7 @@ export async function executeMigration(
           try {
             await stoatClient.setChannelDefaultPermissions(stoatChannelId, perms);
             overrideCount++;
+            await sleep(500); // Rate limit: avoid 429s on bulk override sets
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             progress.errors.push({
@@ -388,6 +389,7 @@ export async function executeMigration(
         try {
           await stoatClient.setChannelRolePermissions(stoatChannelId, stoatRoleId, perms);
           overrideCount++;
+          await sleep(500); // Rate limit: avoid 429s on bulk override sets
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           progress.errors.push({
@@ -397,6 +399,12 @@ export async function executeMigration(
         }
       }
     }
+  }
+
+  if (channelsWithMemberOverrides.size > 0) {
+    progress.warnings.push(
+      `Skipped member-specific permission overrides on: ${[...channelsWithMemberOverrides].join(", ")}`
+    );
   }
 
   if (!dryRun && overrideCount > 0) {
@@ -482,11 +490,6 @@ export async function executeMigration(
             user_kicked: stoatSysChannel,
             user_banned: stoatSysChannel,
           };
-          if (dryRun) {
-            progress.dryRunLog.push(
-              `SET system messages channel → #${guild.systemChannel?.name ?? guild.systemChannelId}`
-            );
-          }
         }
       }
 
