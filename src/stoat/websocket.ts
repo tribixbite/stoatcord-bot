@@ -1,16 +1,32 @@
 /** Stoat/Revolt Bonfire WebSocket client for realtime events */
 
-import type { BonfireMessageEvent, BonfireMessageUpdateEvent, BonfireMessageDeleteEvent } from "./types.ts";
+import type {
+  BonfireMessageEvent,
+  BonfireMessageUpdateEvent,
+  BonfireMessageDeleteEvent,
+  BonfireMessageReactEvent,
+  BonfireMessageUnreactEvent,
+  BonfireChannelStartTypingEvent,
+  BonfireChannelUpdateEvent,
+} from "./types.ts";
 
 type MessageHandler = (event: BonfireMessageEvent) => void;
 type MessageUpdateHandler = (event: BonfireMessageUpdateEvent) => void;
 type MessageDeleteHandler = (event: BonfireMessageDeleteEvent) => void;
+type MessageReactHandler = (event: BonfireMessageReactEvent) => void;
+type MessageUnreactHandler = (event: BonfireMessageUnreactEvent) => void;
+type ChannelStartTypingHandler = (event: BonfireChannelStartTypingEvent) => void;
+type ChannelUpdateHandler = (event: BonfireChannelUpdateEvent) => void;
 type ReadyHandler = (data: unknown) => void;
 
 interface EventHandlers {
   message: MessageHandler[];
   messageUpdate: MessageUpdateHandler[];
   messageDelete: MessageDeleteHandler[];
+  messageReact: MessageReactHandler[];
+  messageUnreact: MessageUnreactHandler[];
+  channelStartTyping: ChannelStartTypingHandler[];
+  channelUpdate: ChannelUpdateHandler[];
   ready: ReadyHandler[];
 }
 
@@ -26,6 +42,10 @@ export class StoatWebSocket {
     message: [],
     messageUpdate: [],
     messageDelete: [],
+    messageReact: [],
+    messageUnreact: [],
+    channelStartTyping: [],
+    channelUpdate: [],
     ready: [],
   };
 
@@ -38,6 +58,10 @@ export class StoatWebSocket {
   on(event: "message", handler: MessageHandler): void;
   on(event: "messageUpdate", handler: MessageUpdateHandler): void;
   on(event: "messageDelete", handler: MessageDeleteHandler): void;
+  on(event: "messageReact", handler: MessageReactHandler): void;
+  on(event: "messageUnreact", handler: MessageUnreactHandler): void;
+  on(event: "channelStartTyping", handler: ChannelStartTypingHandler): void;
+  on(event: "channelUpdate", handler: ChannelUpdateHandler): void;
   on(event: "ready", handler: ReadyHandler): void;
   on(event: keyof EventHandlers, handler: (...args: any[]) => void): void {
     (this.handlers[event] as ((...args: any[]) => void)[]).push(handler);
@@ -133,8 +157,32 @@ export class StoatWebSocket {
         }
         break;
 
+      case "MessageReact":
+        for (const handler of this.handlers.messageReact) {
+          handler(data as unknown as BonfireMessageReactEvent);
+        }
+        break;
+
+      case "MessageUnreact":
+        for (const handler of this.handlers.messageUnreact) {
+          handler(data as unknown as BonfireMessageUnreactEvent);
+        }
+        break;
+
+      case "ChannelStartTyping":
+        for (const handler of this.handlers.channelStartTyping) {
+          handler(data as unknown as BonfireChannelStartTypingEvent);
+        }
+        break;
+
+      case "ChannelUpdate":
+        for (const handler of this.handlers.channelUpdate) {
+          handler(data as unknown as BonfireChannelUpdateEvent);
+        }
+        break;
+
       default:
-        // Ignore other events (ChannelUpdate, ServerUpdate, etc.)
+        // Ignore other events (ServerUpdate, etc.)
         break;
     }
   }

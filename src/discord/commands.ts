@@ -98,6 +98,62 @@ export const commands: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
     .setName("status")
     .setDescription("Show bridge status for this server")
     .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName("archive")
+    .setDescription("Discord message history archive/import system")
+    .addSubcommand((sub) =>
+      sub
+        .setName("start")
+        .setDescription("Start exporting this channel's message history")
+        .addStringOption((opt) =>
+          opt
+            .setName("stoat_channel_id")
+            .setDescription("Stoat channel to import messages into (optional — export-only if omitted)")
+            .setRequired(false)
+        )
+        .addBooleanOption((opt) =>
+          opt
+            .setName("rehost_attachments")
+            .setDescription("Re-host Discord attachments to Stoat CDN (slower but preserves files)")
+            .setRequired(false)
+        )
+        .addBooleanOption((opt) =>
+          opt
+            .setName("preserve_embeds")
+            .setDescription("Convert Discord embeds to Stoat embed format")
+            .setRequired(false)
+        )
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName("status")
+        .setDescription("Show archive job status for this server")
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName("pause")
+        .setDescription("Pause a running archive job")
+        .addStringOption((opt) =>
+          opt
+            .setName("job_id")
+            .setDescription("Archive job ID to pause (defaults to this channel's active job)")
+            .setRequired(false)
+        )
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName("resume")
+        .setDescription("Resume a paused archive job")
+        .addStringOption((opt) =>
+          opt
+            .setName("job_id")
+            .setDescription("Archive job ID to resume (defaults to this channel's paused job)")
+            .setRequired(false)
+        )
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .toJSON(),
 ];
 
 /** Register slash commands globally (or per guild for testing) */

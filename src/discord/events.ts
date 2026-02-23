@@ -11,10 +11,16 @@ import {
 import type { Store } from "../db/store.ts";
 import type { StoatClient } from "../stoat/client.ts";
 import { startMigrationWizard, type MigrateMode, type MigrateCommandOptions } from "../migration/wizard.ts";
+import { exportDiscordChannel } from "../archive/export.ts";
+import { importToStoat } from "../archive/import.ts";
 import {
   relayDiscordToStoat,
   relayDiscordEditToStoat,
   relayDiscordDeleteToStoat,
+  relayDiscordReactionToStoat,
+  relayDiscordUnreactionToStoat,
+  relayDiscordTypingToStoat,
+  relayDiscordChannelUpdateToStoat,
 } from "../bridge/relay.ts";
 import { ensureWebhook } from "../bridge/webhooks.ts";
 
@@ -44,6 +50,10 @@ export function registerDiscordEvents(
 
         case "status":
           await handleStatus(interaction, store);
+          break;
+
+        case "archive":
+          await handleArchive(interaction, store, stoatClient, client);
           break;
       }
     } catch (err) {
@@ -117,6 +127,82 @@ export function registerDiscordEvents(
       } catch (err) {
         console.error("[bridge] Discord→Stoat bulk delete relay error:", err);
       }
+    }
+  });
+
+  // --- Typing relay (Discord → Stoat) ---
+  client.on(Events.TypingStart, async (typing) => {
+    if (typing.user.bot) return;
+
+    const link = store.getChannelByDiscordId(typing.channel.id);
+    if (!link) return;
+
+    try {
+      await relayDiscordTypingToStoat(
+        typing.channel.id,
+        typing.user.id,
+        link.stoat_channel_id,
+        stoatClient
+      );
+    } catch (err) {
+      // Typing failures are non-critical
+      console.warn("[bridge] Discord→Stoat typing relay error:", err);
+    }
+  });
+
+  // --- Reaction sync (Discord → Stoat) ---
+  client.on(Events.MessageReactionAdd, async (reaction, user) => {
+    if (user.bot) return;
+
+    const link = store.getChannelByDiscordId(reaction.message.channelId);
+    if (!link) return;
+
+    try {
+      await relayDiscordReactionToStoat(
+        reaction.message.id,
+        reaction.emoji.name ?? reaction.emoji.id ?? "",
+        store,
+        stoatClient
+      );
+    } catch (err) {
+      console.warn("[bridge] Discord→Stoat reaction relay error:", err);
+    }
+  });
+
+  client.on(Events.MessageReactionRemove, async (reaction, user) => {
+    if (user.bot) return;
+
+    const link = store.getChannelByDiscordId(reaction.message.channelId);
+    if (!link) return;
+
+    try {
+      await relayDiscordUnreactionToStoat(
+        reaction.message.id,
+        reaction.emoji.name ?? reaction.emoji.id ?? "",
+        store,
+        stoatClient
+      );
+    } catch (err) {
+      console.warn("[bridge] Discord→Stoat unreaction relay error:", err);
+    }
+  });
+
+  // --- Channel metadata sync (Discord → Stoat) ---
+  client.on(Events.ChannelUpdate, async (oldChannel, newChannel) => {
+    if (!("guildId" in newChannel)) return;
+
+    const link = store.getChannelByDiscordId(newChannel.id);
+    if (!link) return;
+
+    try {
+      await relayDiscordChannelUpdateToStoat(
+        oldChannel as import("discord.js").GuildChannel,
+        newChannel as import("discord.js").GuildChannel,
+        link.stoat_channel_id,
+        stoatClient
+      );
+    } catch (err) {
+      console.error("[bridge] Discord→Stoat channel metadata sync error:", err);
     }
   });
 
@@ -281,4 +367,300 @@ async function handleStatus(
     .setTimestamp();
 
   await interaction.reply({ embeds: [embed] });
+}
+
+// --- Archive job tracking ---
+// Active archive jobs with their abort controllers for pause/cancel
+const activeArchiveJobs = new Map<string, AbortController>();
+
+/**
+ * /archive command handler with subcommands: start, status, pause, resume
+ */
+async function handleArchive(
+  interaction: ChatInputCommandInteraction,
+  store: Store,
+  stoatClient: StoatClient,
+  client: Client
+): Promise<void> {
+  const guild = interaction.guild;
+  if (!guild) {
+    await interaction.reply({
+      content: "This command can only be used in a server.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const subcommand = interaction.options.getSubcommand();
+
+  switch (subcommand) {
+    case "start":
+      await handleArchiveStart(interaction, store, stoatClient, client);
+      break;
+    case "status":
+      await handleArchiveStatus(interaction, store);
+      break;
+    case "pause":
+      await handleArchivePause(interaction, store);
+      break;
+    case "resume":
+      await handleArchiveResume(interaction, store, stoatClient, client);
+      break;
+  }
+}
+
+/** /archive start — begin exporting this channel's history */
+async function handleArchiveStart(
+  interaction: ChatInputCommandInteraction,
+  store: Store,
+  stoatClient: StoatClient,
+  client: Client
+): Promise<void> {
+  const channelId = interaction.channelId;
+  const guildId = interaction.guildId!;
+  const stoatChannelId = interaction.options.getString("stoat_channel_id") ?? undefined;
+  const rehostAttachments = interaction.options.getBoolean("rehost_attachments") ?? false;
+  const preserveEmbeds = interaction.options.getBoolean("preserve_embeds") ?? false;
+
+  // Check for existing active job
+  const existing = store.getActiveExportJob(channelId);
+  if (existing) {
+    await interaction.reply({
+      content: `An archive job for this channel is already ${existing.status} (job \`${existing.id}\`). Use \`/archive pause\` first.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.deferReply();
+
+  // Create the archive job
+  const channelName = (interaction.channel && "name" in interaction.channel)
+    ? (interaction.channel as import("discord.js").TextChannel).name
+    : channelId;
+
+  const jobId = store.createArchiveJob({
+    guildId,
+    discordChannelId: channelId,
+    discordChannelName: channelName,
+    stoatChannelId,
+    direction: "export",
+  });
+
+  const abortController = new AbortController();
+  activeArchiveJobs.set(jobId, abortController);
+
+  await interaction.editReply({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle("Archive Export Started")
+        .setColor(0x4f8a5e)
+        .setDescription(`Exporting message history from <#${channelId}>...`)
+        .addFields(
+          { name: "Job ID", value: `\`${jobId}\``, inline: true },
+          { name: "Import to Stoat", value: stoatChannelId ? `\`${stoatChannelId}\`` : "Export only", inline: true },
+        )
+        .setTimestamp(),
+    ],
+  });
+
+  // Run export in background (don't block the interaction)
+  exportDiscordChannel(client, store, jobId, channelId, abortController.signal, (progress) => {
+    if (progress.status === "completed" || progress.status === "failed") {
+      activeArchiveJobs.delete(jobId);
+    }
+    // Progress updates are tracked in the DB — use /archive status to check
+  }).then(async (count) => {
+    // Export complete — if stoatChannelId provided, start import
+    if (stoatChannelId && count > 0) {
+      const importJobId = store.createArchiveJob({
+        guildId,
+        discordChannelId: channelId,
+        discordChannelName: channelName,
+        stoatChannelId,
+        direction: "import",
+      });
+
+      const importAbort = new AbortController();
+      activeArchiveJobs.set(importJobId, importAbort);
+
+      try {
+        // Send status update to the channel
+        const channel = await client.channels.fetch(channelId);
+        if (channel?.isTextBased() && "send" in channel) {
+          await (channel as import("discord.js").TextChannel).send({
+            embeds: [
+              new EmbedBuilder()
+                .setTitle("Archive Import Starting")
+                .setColor(0x4f8a5e)
+                .setDescription(`Exported ${count} messages. Now importing to Stoat channel \`${stoatChannelId}\`...`)
+                .addFields(
+                  { name: "Import Job ID", value: `\`${importJobId}\``, inline: true },
+                  { name: "Re-host attachments", value: rehostAttachments ? "Yes" : "No", inline: true },
+                )
+                .setTimestamp(),
+            ],
+          });
+        }
+
+        await importToStoat(stoatClient, store, importJobId, stoatChannelId, importAbort.signal, undefined, {
+          rehostAttachments,
+          reconstructReplies: true,
+          preserveEmbeds,
+        });
+
+        activeArchiveJobs.delete(importJobId);
+      } catch (err) {
+        activeArchiveJobs.delete(importJobId);
+        console.error("[archive] Import failed:", err);
+      }
+    }
+  }).catch((err) => {
+    activeArchiveJobs.delete(jobId);
+    console.error("[archive] Export failed:", err);
+  });
+}
+
+/** /archive status — show archive jobs for this server */
+async function handleArchiveStatus(
+  interaction: ChatInputCommandInteraction,
+  store: Store
+): Promise<void> {
+  const guildId = interaction.guildId!;
+  const jobs = store.getArchiveJobsForGuild(guildId);
+
+  if (jobs.length === 0) {
+    await interaction.reply({
+      content: "No archive jobs found for this server.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  // Show most recent 10 jobs
+  const recent = jobs.slice(0, 10);
+  const lines = recent.map((j) => {
+    const pct = j.total_messages > 0
+      ? Math.round((j.processed_messages / j.total_messages) * 100)
+      : 0;
+    const statusEmoji = j.status === "completed" ? "\u2705"
+      : j.status === "running" ? "\u23f3"
+      : j.status === "paused" ? "\u23f8\ufe0f"
+      : j.status === "failed" ? "\u274c"
+      : "\u23f3";
+    return `${statusEmoji} \`${j.id.slice(0, 8)}\` ${j.direction} **${j.discord_channel_name ?? "unknown"}** — ${j.processed_messages}/${j.total_messages} (${pct}%) [${j.status}]`;
+  });
+
+  const embed = new EmbedBuilder()
+    .setTitle("Archive Jobs")
+    .setColor(0x4f8a5e)
+    .setDescription(lines.join("\n"))
+    .setTimestamp();
+
+  await interaction.reply({ embeds: [embed] });
+}
+
+/** /archive pause — pause a running archive job */
+async function handleArchivePause(
+  interaction: ChatInputCommandInteraction,
+  store: Store
+): Promise<void> {
+  let jobId = interaction.options.getString("job_id") ?? undefined;
+
+  // Default to this channel's active job
+  if (!jobId) {
+    const activeJob = store.getActiveExportJob(interaction.channelId);
+    if (activeJob) {
+      jobId = activeJob.id;
+    }
+  }
+
+  if (!jobId) {
+    await interaction.reply({
+      content: "No running archive job found. Specify a job ID with `job_id`.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const controller = activeArchiveJobs.get(jobId);
+  if (!controller) {
+    await interaction.reply({
+      content: `Job \`${jobId}\` is not actively running in this session.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  controller.abort();
+  activeArchiveJobs.delete(jobId);
+
+  await interaction.reply({
+    content: `Archive job \`${jobId}\` has been paused. Use \`/archive resume\` to continue.`,
+    ephemeral: true,
+  });
+}
+
+/** /archive resume — resume a paused archive job */
+async function handleArchiveResume(
+  interaction: ChatInputCommandInteraction,
+  store: Store,
+  stoatClient: StoatClient,
+  client: Client
+): Promise<void> {
+  let jobId = interaction.options.getString("job_id") ?? undefined;
+
+  // Find a paused job for this channel
+  if (!jobId) {
+    const jobs = store.getArchiveJobsForGuild(interaction.guildId!);
+    const paused = jobs.find((j) =>
+      j.discord_channel_id === interaction.channelId && j.status === "paused"
+    );
+    if (paused) {
+      jobId = paused.id;
+    }
+  }
+
+  if (!jobId) {
+    await interaction.reply({
+      content: "No paused archive job found. Specify a job ID with `job_id`.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const job = store.getArchiveJob(jobId);
+  if (!job || job.status !== "paused") {
+    await interaction.reply({
+      content: `Job \`${jobId}\` is not in a paused state (current: ${job?.status ?? "not found"}).`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.deferReply();
+
+  const abortController = new AbortController();
+  activeArchiveJobs.set(jobId, abortController);
+
+  await interaction.editReply({
+    content: `Resuming archive ${job.direction} job \`${jobId}\`...`,
+  });
+
+  // Resume in background
+  if (job.direction === "export") {
+    exportDiscordChannel(client, store, jobId, job.discord_channel_id, abortController.signal).then(() => {
+      activeArchiveJobs.delete(jobId!);
+    }).catch((err) => {
+      activeArchiveJobs.delete(jobId!);
+      console.error("[archive] Export resume failed:", err);
+    });
+  } else if (job.direction === "import" && job.stoat_channel_id) {
+    importToStoat(stoatClient, store, jobId, job.stoat_channel_id, abortController.signal).then(() => {
+      activeArchiveJobs.delete(jobId!);
+    }).catch((err) => {
+      activeArchiveJobs.delete(jobId!);
+      console.error("[archive] Import resume failed:", err);
+    });
+  }
 }

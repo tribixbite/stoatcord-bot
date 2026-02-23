@@ -138,8 +138,8 @@ async function main(): Promise<void> {
     // and reply-based migration approval detection
     setupStoatCommands(stoatWs, store, stoatClient, botSelfId, discordClient);
 
-    // Set up Stoat→Discord message relay
-    setupStoatToDiscordRelay(stoatWs, store, config.stoatCdnUrl, stoatClient);
+    // Set up Stoat→Discord message relay (includes typing, reactions, channel metadata sync)
+    setupStoatToDiscordRelay(stoatWs, store, config.stoatCdnUrl, stoatClient, discordClient);
 
     // Register Discord event handlers (includes Discord→Stoat relay)
     registerDiscordEvents(discordClient, store, stoatClient, config.stoatCdnUrl);
@@ -448,6 +448,138 @@ async function main(): Promise<void> {
             }),
             corsHeaders
           );
+        }
+
+        // --- Archive API routes ---
+
+        // Route: GET /api/archive/status — get archive job status
+        if (url.pathname === "/api/archive/status" && method === "GET") {
+          const guildId = url.searchParams.get("guildId");
+          const jobId = url.searchParams.get("jobId");
+
+          if (jobId) {
+            const job = store.getArchiveJob(jobId);
+            if (!job) {
+              return Response.json({ error: "Job not found" }, { status: 404, headers: corsHeaders });
+            }
+            const counts = store.getArchiveMessageCounts(jobId);
+            return addHeaders(Response.json({ ...job, counts }), corsHeaders);
+          }
+
+          if (guildId) {
+            const jobs = store.getArchiveJobsForGuild(guildId);
+            return addHeaders(Response.json({ jobs }), corsHeaders);
+          }
+
+          return Response.json(
+            { error: "guildId or jobId query param required" },
+            { status: 400, headers: corsHeaders }
+          );
+        }
+
+        // Route: POST /api/archive/start — start an archive export
+        if (url.pathname === "/api/archive/start" && method === "POST") {
+          if (!discordClient) return Response.json({ error: "Discord not connected" }, { status: 503, headers: corsHeaders });
+
+          const body = (await req.json()) as {
+            guildId: string;
+            discordChannelId: string;
+            stoatChannelId?: string;
+            rehostAttachments?: boolean;
+            preserveEmbeds?: boolean;
+          };
+
+          if (!body.guildId || !body.discordChannelId) {
+            return Response.json(
+              { error: "guildId and discordChannelId are required" },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+
+          // Check for existing active job
+          const existing = store.getActiveExportJob(body.discordChannelId);
+          if (existing) {
+            return Response.json(
+              { error: `Active job exists: ${existing.id} (${existing.status})` },
+              { status: 409, headers: corsHeaders }
+            );
+          }
+
+          // Lazy-import archive modules to avoid circular deps at startup
+          const { exportDiscordChannel } = await import("./archive/export.ts");
+
+          const jobId = store.createArchiveJob({
+            guildId: body.guildId,
+            discordChannelId: body.discordChannelId,
+            discordChannelName: body.discordChannelId,
+            stoatChannelId: body.stoatChannelId,
+            direction: "export",
+          });
+
+          // Run export in background
+          exportDiscordChannel(discordClient, store, jobId, body.discordChannelId).catch((err) => {
+            console.error("[archive-api] Export failed:", err);
+          });
+
+          return addHeaders(
+            Response.json({ jobId, status: "started" }, { status: 201 }),
+            corsHeaders
+          );
+        }
+
+        // Route: POST /api/archive/pause — pause a running job
+        if (url.pathname === "/api/archive/pause" && method === "POST") {
+          const body = (await req.json()) as { jobId: string };
+          if (!body.jobId) {
+            return Response.json({ error: "jobId is required" }, { status: 400, headers: corsHeaders });
+          }
+          const job = store.getArchiveJob(body.jobId);
+          if (!job) return Response.json({ error: "Job not found" }, { status: 404, headers: corsHeaders });
+          if (job.status !== "running") {
+            return Response.json({ error: `Job is ${job.status}, not running` }, { status: 400, headers: corsHeaders });
+          }
+          // Mark as paused — the running process checks store status
+          store.updateArchiveJobStatus(body.jobId, "paused", {
+            processedMessages: job.processed_messages,
+          });
+          return addHeaders(Response.json({ ok: true, status: "paused" }), corsHeaders);
+        }
+
+        // Route: POST /api/archive/resume — resume a paused job
+        if (url.pathname === "/api/archive/resume" && method === "POST") {
+          if (!discordClient) return Response.json({ error: "Discord not connected" }, { status: 503, headers: corsHeaders });
+
+          const body = (await req.json()) as {
+            jobId: string;
+            rehostAttachments?: boolean;
+            preserveEmbeds?: boolean;
+          };
+          if (!body.jobId) {
+            return Response.json({ error: "jobId is required" }, { status: 400, headers: corsHeaders });
+          }
+          const job = store.getArchiveJob(body.jobId);
+          if (!job) return Response.json({ error: "Job not found" }, { status: 404, headers: corsHeaders });
+          if (job.status !== "paused") {
+            return Response.json({ error: `Job is ${job.status}, not paused` }, { status: 400, headers: corsHeaders });
+          }
+
+          if (job.direction === "export") {
+            const { exportDiscordChannel } = await import("./archive/export.ts");
+            exportDiscordChannel(discordClient, store, body.jobId, job.discord_channel_id).catch((err) => {
+              console.error("[archive-api] Export resume failed:", err);
+            });
+          } else if (job.direction === "import" && job.stoat_channel_id) {
+            const { importToStoat } = await import("./archive/import.ts");
+            importToStoat(stoatClient, store, body.jobId, job.stoat_channel_id, undefined, undefined, {
+              rehostAttachments: body.rehostAttachments ?? false,
+              reconstructReplies: true,
+              preserveEmbeds: body.preserveEmbeds ?? false,
+            }).catch((err) => {
+              console.error("[archive-api] Import resume failed:", err);
+            });
+          }
+
+          return addHeaders(Response.json({ ok: true, status: "resumed" }), corsHeaders);
         }
 
         // 404

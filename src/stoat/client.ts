@@ -156,6 +156,39 @@ export class StoatClient {
     );
   }
 
+  // --- Typing ---
+
+  /** Send a typing indicator to a channel */
+  async beginTyping(channelId: string): Promise<void> {
+    await this.request<unknown>("POST", `/channels/${channelId}/typing`);
+  }
+
+  // --- Reactions ---
+
+  /** Add a reaction to a message (emoji is Unicode char or custom emoji ID) */
+  async reactToMessage(
+    channelId: string,
+    messageId: string,
+    emoji: string
+  ): Promise<void> {
+    await this.request<unknown>(
+      "PUT",
+      `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}`
+    );
+  }
+
+  /** Remove own reaction from a message */
+  async unreactToMessage(
+    channelId: string,
+    messageId: string,
+    emoji: string
+  ): Promise<void> {
+    await this.request<unknown>(
+      "DELETE",
+      `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}`
+    );
+  }
+
   // --- Roles ---
 
   async createRole(

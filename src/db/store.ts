@@ -517,23 +517,26 @@ export class Store {
 
   // --- Archive Jobs ---
 
+  /** Create a new archive job. Auto-generates an ID if not provided. Returns the job ID. */
   createArchiveJob(job: {
-    id: string;
+    id?: string;
     guildId: string;
     discordChannelId: string;
     discordChannelName?: string;
     stoatChannelId?: string;
     direction: "export" | "import";
-  }): void {
+  }): string {
+    const id = job.id ?? crypto.randomUUID().slice(0, 8);
     this.db
       .query(
         `INSERT INTO archive_jobs (id, guild_id, discord_channel_id, discord_channel_name, stoat_channel_id, direction)
          VALUES (?, ?, ?, ?, ?, ?)`
       )
       .run(
-        job.id, job.guildId, job.discordChannelId,
+        id, job.guildId, job.discordChannelId,
         job.discordChannelName ?? null, job.stoatChannelId ?? null, job.direction
       );
+    return id;
   }
 
   getArchiveJob(jobId: string): ArchiveJobRow | null {

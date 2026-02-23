@@ -8,6 +8,10 @@ import type {
   BonfireMessageEvent,
   BonfireMessageUpdateEvent,
   BonfireMessageDeleteEvent,
+  BonfireMessageReactEvent,
+  BonfireMessageUnreactEvent,
+  BonfireChannelStartTypingEvent,
+  BonfireChannelUpdateEvent,
   SendMessageRequest,
   User,
 } from "../stoat/types.ts";
@@ -35,6 +39,18 @@ const EDIT_ID_TTL = 10_000; // 10 seconds
 // Track delete IDs to prevent delete echo loops
 const recentDeleteIds = new Set<string>();
 const DELETE_ID_TTL = 10_000; // 10 seconds
+
+// Track reaction IDs to prevent reaction echo loops
+const recentReactIds = new Set<string>();
+const REACT_ID_TTL = 10_000; // 10 seconds
+
+// Debounce typing events: max 1 per 5 seconds per user per channel
+const typingDebounce = new Map<string, number>(); // "channelId:userId" → last sent timestamp
+const TYPING_DEBOUNCE_MS = 5_000;
+
+// Track channel metadata updates to prevent echo loops
+const recentChannelUpdates = new Set<string>();
+const CHANNEL_UPDATE_TTL = 10_000; // 10 seconds
 
 // User cache to avoid repeated API lookups for display names/avatars
 const userCache = new Map<string, { user: User; fetchedAt: number }>();
@@ -84,6 +100,34 @@ function markDeleted(id: string): void {
 
 function wasDeleted(id: string): boolean {
   return recentDeleteIds.has(id);
+}
+
+function markReacted(key: string): void {
+  recentReactIds.add(key);
+  setTimeout(() => recentReactIds.delete(key), REACT_ID_TTL);
+}
+
+function wasReacted(key: string): boolean {
+  return recentReactIds.has(key);
+}
+
+function markChannelUpdated(id: string): void {
+  recentChannelUpdates.add(id);
+  setTimeout(() => recentChannelUpdates.delete(id), CHANNEL_UPDATE_TTL);
+}
+
+function wasChannelUpdated(id: string): boolean {
+  return recentChannelUpdates.has(id);
+}
+
+/** Check if a typing event should be sent (debounce: 1 per 5s per user per channel) */
+function shouldSendTyping(channelId: string, userId: string): boolean {
+  const key = `${channelId}:${userId}`;
+  const now = Date.now();
+  const last = typingDebounce.get(key);
+  if (last && now - last < TYPING_DEBOUNCE_MS) return false;
+  typingDebounce.set(key, now);
+  return true;
 }
 
 /**
@@ -191,7 +235,8 @@ export function setupStoatToDiscordRelay(
   stoatWs: StoatWebSocket,
   store: Store,
   stoatCdnUrl: string,
-  stoatClient?: StoatClient
+  stoatClient?: StoatClient,
+  discordClient?: import("discord.js").Client
 ): void {
   stoatWs.on("message", async (event: BonfireMessageEvent) => {
     // Skip messages we bridged TO Stoat (prevent echo)
@@ -347,6 +392,107 @@ export function setupStoatToDiscordRelay(
       console.error("[bridge] Stoat→Discord delete sync error:", err);
     }
   });
+
+  // --- Stoat→Discord typing relay ---
+  stoatWs.on("channelStartTyping", async (event: BonfireChannelStartTypingEvent) => {
+    if (!discordClient) return;
+
+    const link = store.getChannelByStoatId(event.id);
+    if (!link) return;
+
+    // Debounce: max 1 per 5s per user per channel
+    if (!shouldSendTyping(event.id, event.user)) return;
+
+    try {
+      const channel = await discordClient.channels.fetch(link.discord_channel_id);
+      if (channel?.isTextBased() && "sendTyping" in channel) {
+        await (channel as import("discord.js").TextChannel).sendTyping();
+      }
+    } catch (err) {
+      // Typing failures are non-critical — just log and move on
+      console.warn("[bridge] Stoat→Discord typing relay error:", err);
+    }
+  });
+
+  // --- Stoat→Discord reaction sync ---
+  stoatWs.on("messageReact", async (event: BonfireMessageReactEvent) => {
+    const reactKey = `${event.id}:${event.emoji_id}:add`;
+    if (wasReacted(reactKey)) return;
+
+    const mapping = store.getBridgeMessageByStoatId(event.id);
+    if (!mapping) return;
+
+    if (!discordClient) return;
+
+    try {
+      const channel = await discordClient.channels.fetch(mapping.discord_channel_id);
+      if (!channel?.isTextBased()) return;
+      const message = await (channel as import("discord.js").TextChannel).messages.fetch(mapping.discord_message_id);
+      // Stoat emoji_id is either a Unicode char or a custom emoji ID
+      // For custom emojis, try to find by name from the guild
+      markReacted(reactKey);
+      await message.react(event.emoji_id);
+    } catch (err) {
+      console.warn("[bridge] Stoat→Discord reaction sync error:", err);
+    }
+  });
+
+  stoatWs.on("messageUnreact", async (event: BonfireMessageUnreactEvent) => {
+    const reactKey = `${event.id}:${event.emoji_id}:remove`;
+    if (wasReacted(reactKey)) return;
+
+    const mapping = store.getBridgeMessageByStoatId(event.id);
+    if (!mapping) return;
+
+    if (!discordClient) return;
+
+    try {
+      const channel = await discordClient.channels.fetch(mapping.discord_channel_id);
+      if (!channel?.isTextBased()) return;
+      const message = await (channel as import("discord.js").TextChannel).messages.fetch(mapping.discord_message_id);
+      // Remove the bot's own reaction (can only remove self reactions without Manage Messages)
+      const reaction = message.reactions.cache.get(event.emoji_id);
+      if (reaction?.me) {
+        markReacted(reactKey);
+        await reaction.users.remove(discordClient.user!.id);
+      }
+    } catch (err) {
+      console.warn("[bridge] Stoat→Discord unreact sync error:", err);
+    }
+  });
+
+  // --- Stoat→Discord channel metadata sync ---
+  stoatWs.on("channelUpdate", async (event: BonfireChannelUpdateEvent) => {
+    if (wasChannelUpdated(event.id)) return;
+
+    const link = store.getChannelByStoatId(event.id);
+    if (!link) return;
+
+    if (!discordClient) return;
+
+    // Only sync name, description, nsfw changes
+    const { data } = event;
+    if (!data.name && !data.description && data.nsfw === undefined && !event.clear?.length) return;
+
+    try {
+      const channel = await discordClient.channels.fetch(link.discord_channel_id);
+      if (!channel || !("edit" in channel)) return;
+
+      const editData: Record<string, unknown> = {};
+      if (data.name) editData.name = data.name.slice(0, 100); // Discord max 100 chars
+      if (data.description !== undefined) editData.topic = data.description;
+      if (data.nsfw !== undefined) editData.nsfw = data.nsfw;
+      // Handle cleared fields
+      if (event.clear?.includes("Description")) editData.topic = "";
+
+      if (Object.keys(editData).length === 0) return;
+
+      markChannelUpdated(link.discord_channel_id);
+      await (channel as import("discord.js").TextChannel).edit(editData);
+    } catch (err) {
+      console.error("[bridge] Stoat→Discord channel metadata sync error:", err);
+    }
+  });
 }
 
 /**
@@ -404,5 +550,126 @@ export async function relayDiscordDeleteToStoat(
     store.deleteBridgeMessage(messageId);
   } catch (err) {
     console.error("[bridge] Discord→Stoat delete sync error:", err);
+  }
+}
+
+/**
+ * Relay a Discord typing indicator to the linked Stoat channel.
+ * Debounced: max 1 per 5 seconds per user per channel.
+ */
+export async function relayDiscordTypingToStoat(
+  discordChannelId: string,
+  discordUserId: string,
+  stoatChannelId: string,
+  stoatClient: StoatClient
+): Promise<void> {
+  if (!shouldSendTyping(discordChannelId, discordUserId)) return;
+  try {
+    await stoatClient.beginTyping(stoatChannelId);
+  } catch {
+    // Typing failures are non-critical — silently ignore
+  }
+}
+
+/**
+ * Relay a Discord reaction to the linked Stoat message.
+ * Called from events.ts on messageReactionAdd.
+ */
+export async function relayDiscordReactionToStoat(
+  messageId: string,
+  emojiIdentifier: string,
+  store: Store,
+  stoatClient: StoatClient
+): Promise<void> {
+  const reactKey = `${messageId}:${emojiIdentifier}:add`;
+  if (wasReacted(reactKey)) return;
+
+  const mapping = store.getBridgeMessageByDiscordId(messageId);
+  if (!mapping) return;
+
+  try {
+    markReacted(reactKey);
+    await stoatClient.reactToMessage(
+      mapping.stoat_channel_id,
+      mapping.stoat_message_id,
+      emojiIdentifier
+    );
+  } catch (err) {
+    console.warn("[bridge] Discord→Stoat reaction sync error:", err);
+  }
+}
+
+/**
+ * Relay a Discord reaction removal to the linked Stoat message.
+ * Called from events.ts on messageReactionRemove.
+ */
+export async function relayDiscordUnreactionToStoat(
+  messageId: string,
+  emojiIdentifier: string,
+  store: Store,
+  stoatClient: StoatClient
+): Promise<void> {
+  const reactKey = `${messageId}:${emojiIdentifier}:remove`;
+  if (wasReacted(reactKey)) return;
+
+  const mapping = store.getBridgeMessageByDiscordId(messageId);
+  if (!mapping) return;
+
+  try {
+    markReacted(reactKey);
+    await stoatClient.unreactToMessage(
+      mapping.stoat_channel_id,
+      mapping.stoat_message_id,
+      emojiIdentifier
+    );
+  } catch (err) {
+    console.warn("[bridge] Discord→Stoat unreaction sync error:", err);
+  }
+}
+
+/**
+ * Relay a Discord channel metadata update to the linked Stoat channel.
+ * Syncs name, description/topic, and NSFW flag.
+ */
+export async function relayDiscordChannelUpdateToStoat(
+  oldChannel: import("discord.js").GuildChannel,
+  newChannel: import("discord.js").GuildChannel,
+  stoatChannelId: string,
+  stoatClient: StoatClient
+): Promise<void> {
+  // Skip if this was an echo from our own Stoat→Discord sync
+  if (wasChannelUpdated(newChannel.id)) return;
+
+  const editData: Record<string, unknown> = {};
+
+  if (oldChannel.name !== newChannel.name) {
+    // Stoat channel names max 32 chars
+    editData.name = newChannel.name.slice(0, 32);
+  }
+
+  // Topic is on TextChannel, not GuildChannel
+  if ("topic" in oldChannel && "topic" in newChannel) {
+    const oldTopic = (oldChannel as import("discord.js").TextChannel).topic;
+    const newTopic = (newChannel as import("discord.js").TextChannel).topic;
+    if (oldTopic !== newTopic) {
+      editData.description = newTopic ?? "";
+    }
+  }
+
+  if ("nsfw" in oldChannel && "nsfw" in newChannel) {
+    const oldNsfw = (oldChannel as import("discord.js").TextChannel).nsfw;
+    const newNsfw = (newChannel as import("discord.js").TextChannel).nsfw;
+    if (oldNsfw !== newNsfw) {
+      editData.nsfw = newNsfw;
+    }
+  }
+
+  if (Object.keys(editData).length === 0) return;
+
+  try {
+    markChannelUpdated(stoatChannelId);
+    await stoatClient.editChannel(stoatChannelId, editData);
+  } catch (err) {
+    console.error("[bridge] Discord→Stoat channel metadata sync error:", err);
   }
 }

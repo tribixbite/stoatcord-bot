@@ -135,6 +135,9 @@ export function setupStoatCommands(
       case "diag":
         await handleDiagCommand(event, serverId, stoatClient);
         break;
+      case "archive":
+        await handleArchiveCommand(event, serverId, stoatClient, store);
+        break;
       case "help":
         await handleHelpCommand(event, stoatClient);
         break;
@@ -415,6 +418,49 @@ async function handleDiagCommand(
   });
 }
 
+/** !stoatcord archive [status] — show archive job status for the linked guild */
+async function handleArchiveCommand(
+  event: BonfireMessageEvent,
+  serverId: string,
+  stoatClient: StoatClient,
+  store: Store
+): Promise<void> {
+  // Find the linked guild for this Stoat server
+  const link = store.getGuildForStoatServer(serverId);
+  if (!link) {
+    await stoatClient.sendMessage(
+      event.channel,
+      "This Stoat server is not linked to a Discord guild. Link one first with `!stoatcord code`.",
+      { replies: [{ id: event._id, mention: false }] }
+    );
+    return;
+  }
+
+  const jobs = store.getArchiveJobsForGuild(link.discord_guild_id);
+  if (jobs.length === 0) {
+    await stoatClient.sendMessage(
+      event.channel,
+      "No archive jobs found. Start one from Discord with `/archive start`.",
+      { replies: [{ id: event._id, mention: false }] }
+    );
+    return;
+  }
+
+  const recent = jobs.slice(0, 10);
+  const lines = recent.map((j) => {
+    const pct = j.total_messages > 0
+      ? Math.round((j.processed_messages / j.total_messages) * 100)
+      : 0;
+    return `\`${j.id.slice(0, 8)}\` ${j.direction} **${j.discord_channel_name ?? "?"}** — ${j.processed_messages}/${j.total_messages} (${pct}%) [${j.status}]`;
+  });
+
+  await stoatClient.sendMessage(
+    event.channel,
+    `**Archive Jobs** (${jobs.length} total)\n\n${lines.join("\n")}`,
+    { replies: [{ id: event._id, mention: false }] }
+  );
+}
+
 /** !stoatcord help — show available commands */
 async function handleHelpCommand(
   event: BonfireMessageEvent,
@@ -427,6 +473,8 @@ async function handleHelpCommand(
     `\`!stoatcord code\` — Generate a one-time migration code (admin only)\n` +
     `\`!stoatcord request <discord_guild_id>\` — Send migration request to a Discord guild (admin only)\n` +
     `\`!stoatcord status\` — Show bridge link status\n\n` +
+    `**Archive:**\n` +
+    `\`!stoatcord archive\` — Show archive job status for the linked Discord guild\n\n` +
     `**Diagnostics:**\n` +
     `\`!stoatcord ping <user_id>\` — Send a mention to test push notifications\n` +
     `\`!stoatcord diag\` — Run notification diagnostics\n` +

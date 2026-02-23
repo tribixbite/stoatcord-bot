@@ -265,7 +265,11 @@ export type BonfireEvent =
   | { type: "Message"; message: Message } // alias for the event — raw has no wrapper
   | BonfireMessageEvent
   | BonfireMessageUpdateEvent
-  | BonfireMessageDeleteEvent;
+  | BonfireMessageDeleteEvent
+  | BonfireMessageReactEvent
+  | BonfireMessageUnreactEvent
+  | BonfireChannelStartTypingEvent
+  | BonfireChannelUpdateEvent;
 
 export interface BonfireMessageEvent {
   type: "Message";
@@ -291,6 +295,35 @@ export interface BonfireMessageDeleteEvent {
   type: "MessageDelete";
   id: string;
   channel: string;
+}
+
+export interface BonfireMessageReactEvent {
+  type: "MessageReact";
+  id: string;
+  channel_id: string;
+  user_id: string;
+  emoji_id: string;
+}
+
+export interface BonfireMessageUnreactEvent {
+  type: "MessageUnreact";
+  id: string;
+  channel_id: string;
+  user_id: string;
+  emoji_id: string;
+}
+
+export interface BonfireChannelStartTypingEvent {
+  type: "ChannelStartTyping";
+  id: string; // channel ID
+  user: string; // user ID
+}
+
+export interface BonfireChannelUpdateEvent {
+  type: "ChannelUpdate";
+  id: string;
+  data: Partial<Channel>;
+  clear?: Array<"Icon" | "Description">;
 }
 
 // --- Revolt permission bits (matching the Android app's PermissionBit) ---
