@@ -1,12 +1,14 @@
 /**
  * Archive import pipeline: SQLite → Stoat.
  * Reads exported messages from archive_messages and sends them to Stoat
- * with masquerade to preserve author identity and embedded timestamps.
+ * with masquerade to preserve author identity, embedded timestamps,
+ * attachment re-hosting, reply chain reconstruction, and embed preservation.
  */
 
 import type { StoatClient } from "../stoat/client.ts";
 import type { Store } from "../db/store.ts";
 import type { ArchiveMessageRow } from "../db/schema.ts";
+import type { Embed, SendMessageRequest } from "../stoat/types.ts";
 import { discordToRevolt, truncateForRevolt } from "../bridge/format.ts";
 import { sleep } from "../util.ts";
 
@@ -14,12 +16,26 @@ import { sleep } from "../util.ts";
 const SEND_DELAY_MS = 1100;
 /** Batch size for fetching un-imported messages from SQLite */
 const IMPORT_BATCH_SIZE = 50;
+/** Max attachment size for re-hosting (20MB Autumn limit) */
+const MAX_REHOST_SIZE = 20 * 1024 * 1024;
+
+export interface ImportOptions {
+  /** Re-host Discord attachments to Autumn CDN (slower but preserves files) */
+  rehostAttachments?: boolean;
+  /** Reconstruct reply chains using Stoat replies[] (requires chronological import) */
+  reconstructReplies?: boolean;
+  /** Convert Discord embeds to Stoat embed format */
+  preserveEmbeds?: boolean;
+}
 
 export interface ImportProgress {
   jobId: string;
   status: "running" | "paused" | "completed" | "failed";
   totalMessages: number;
   importedMessages: number;
+  rehostSuccesses: number;
+  rehostFailures: number;
+  repliesLinked: number;
   error?: string;
 }
 
@@ -28,14 +44,7 @@ export type ImportProgressCallback = (progress: ImportProgress) => void;
 /**
  * Import archived messages into a Stoat channel.
  * Reads from archive_messages, sends with masquerade + timestamp header.
- *
- * @param stoatClient - Authenticated Stoat API client
- * @param store - Database store with archive methods
- * @param jobId - Archive job ID (export must be completed first)
- * @param stoatChannelId - Target Stoat channel
- * @param signal - Optional AbortSignal for cancellation
- * @param onProgress - Optional callback for progress updates
- * @returns Number of messages imported
+ * Optionally re-hosts attachments, reconstructs reply chains, and preserves embeds.
  */
 export async function importToStoat(
   stoatClient: StoatClient,
@@ -43,16 +52,25 @@ export async function importToStoat(
   jobId: string,
   stoatChannelId: string,
   signal?: AbortSignal,
-  onProgress?: ImportProgressCallback
+  onProgress?: ImportProgressCallback,
+  options: ImportOptions = {}
 ): Promise<number> {
+  const {
+    rehostAttachments = false,
+    reconstructReplies = true,
+    preserveEmbeds = false,
+  } = options;
+
   const job = store.getArchiveJob(jobId);
   if (!job) throw new Error(`Archive job ${jobId} not found`);
 
-  // Update job with target channel
   store.updateArchiveJobStatus(jobId, "running");
 
   const counts = store.getArchiveMessageCounts(jobId);
   let importedCount = counts.imported;
+  let rehostSuccesses = 0;
+  let rehostFailures = 0;
+  let repliesLinked = 0;
 
   const reportProgress = (status: ImportProgress["status"], error?: string) => {
     onProgress?.({
@@ -60,6 +78,9 @@ export async function importToStoat(
       status,
       totalMessages: counts.total,
       importedMessages: importedCount,
+      rehostSuccesses,
+      rehostFailures,
+      repliesLinked,
       error,
     });
   };
@@ -69,7 +90,6 @@ export async function importToStoat(
   try {
     let batch: ArchiveMessageRow[];
 
-    // Process un-imported messages in batches
     while ((batch = store.getUnimportedMessages(jobId, IMPORT_BATCH_SIZE)).length > 0) {
       for (const msg of batch) {
         if (signal?.aborted) {
@@ -81,13 +101,18 @@ export async function importToStoat(
         }
 
         try {
-          const stoatMsgId = await sendArchivedMessage(stoatClient, stoatChannelId, msg);
-          if (stoatMsgId) {
-            store.markArchiveMessageImported(msg.id, stoatMsgId);
+          const result = await sendArchivedMessage(
+            stoatClient, store, stoatChannelId, msg, jobId,
+            { rehostAttachments, reconstructReplies, preserveEmbeds }
+          );
+          if (result.stoatMsgId) {
+            store.markArchiveMessageImported(msg.id, result.stoatMsgId);
             importedCount++;
+            rehostSuccesses += result.rehostSuccesses;
+            rehostFailures += result.rehostFailures;
+            if (result.replyLinked) repliesLinked++;
           }
         } catch (err) {
-          // Log but continue — don't fail the entire import on one message
           console.warn(
             `[archive] Failed to import message ${msg.discord_message_id}:`,
             err instanceof Error ? err.message : err
@@ -97,7 +122,6 @@ export async function importToStoat(
         await sleep(SEND_DELAY_MS);
       }
 
-      // Update progress after each batch
       store.updateArchiveJobStatus(jobId, "running", {
         processedMessages: importedCount,
       });
@@ -121,16 +145,31 @@ export async function importToStoat(
   }
 }
 
+interface SendResult {
+  stoatMsgId: string | null;
+  rehostSuccesses: number;
+  rehostFailures: number;
+  replyLinked: boolean;
+}
+
 /**
- * Send a single archived message to Stoat with masquerade and timestamp.
- * Returns the Stoat message ID on success.
+ * Send a single archived message to Stoat with all enhancements.
  */
 async function sendArchivedMessage(
   stoatClient: StoatClient,
+  store: Store,
   channelId: string,
-  msg: ArchiveMessageRow
-): Promise<string | null> {
-  // Build content with original timestamp header (locale-independent)
+  msg: ArchiveMessageRow,
+  jobId: string,
+  options: { rehostAttachments: boolean; reconstructReplies: boolean; preserveEmbeds: boolean }
+): Promise<SendResult> {
+  const result: SendResult = {
+    stoatMsgId: null,
+    rehostSuccesses: 0,
+    rehostFailures: 0,
+    replyLinked: false,
+  };
+
   const ts = new Date(msg.timestamp);
   const timestampStr = formatTimestamp(ts);
 
@@ -141,15 +180,41 @@ async function sendArchivedMessage(
     content = discordToRevolt(msg.content);
   }
 
-  // Append attachment URLs (not re-hosting during archive import to avoid CDN flooding)
+  // Handle attachments
+  const autumnIds: string[] = [];
   if (msg.attachments_json) {
     try {
-      const attachments = JSON.parse(msg.attachments_json) as Array<{ url: string; name: string }>;
+      const attachments = JSON.parse(msg.attachments_json) as Array<{
+        url: string; name: string; size?: number; id?: string;
+      }>;
+
       for (const att of attachments) {
+        if (options.rehostAttachments && (att.size ?? 0) <= MAX_REHOST_SIZE) {
+          // Re-host: download from Discord CDN, upload to Autumn
+          try {
+            const res = await fetch(att.url);
+            if (res.ok) {
+              const buffer = new Uint8Array(await res.arrayBuffer());
+              if (buffer.length <= MAX_REHOST_SIZE) {
+                const uploaded = await stoatClient.uploadFile(
+                  "attachments", buffer, att.name ?? "attachment"
+                );
+                autumnIds.push(uploaded.id);
+                result.rehostSuccesses++;
+                continue;
+              }
+            }
+          } catch (err) {
+            console.warn(`[archive] Attachment re-host failed for ${att.name}:`, err);
+            result.rehostFailures++;
+          }
+        }
+
+        // Fallback: link to Discord CDN URL
         content += `\n[${att.name}](${att.url})`;
       }
     } catch {
-      // Malformed JSON, skip attachments
+      // Malformed JSON
     }
   }
 
@@ -157,19 +222,73 @@ async function sendArchivedMessage(
   content = `*${timestampStr}*\n${content}`.trim();
   content = truncateForRevolt(content);
 
-  if (!content) return null;
+  if (!content && autumnIds.length === 0) return result;
 
-  const sent = await stoatClient.sendMessage(channelId, content, {
+  // Build send options
+  const sendOpts: Partial<Omit<SendMessageRequest, "content">> = {
     masquerade: {
       name: msg.author_name,
       avatar: msg.author_avatar_url ?? undefined,
     },
-  });
+  };
 
-  return sent._id ?? null;
+  // Attach re-hosted files
+  if (autumnIds.length > 0) {
+    sendOpts.attachments = autumnIds;
+  }
+
+  // Reconstruct reply chain
+  if (options.reconstructReplies && msg.reply_to_id) {
+    const parentStoatId = store.getImportedStoatId(jobId, msg.reply_to_id);
+    if (parentStoatId) {
+      sendOpts.replies = [{ id: parentStoatId, mention: false }];
+      result.replyLinked = true;
+    } else {
+      // Parent not yet imported or not in this job — add quote fallback
+      content = `> *Replying to an earlier message*\n${content}`;
+      content = truncateForRevolt(content);
+    }
+  }
+
+  // Preserve embeds
+  if (options.preserveEmbeds && msg.embeds_json) {
+    try {
+      const discordEmbeds = JSON.parse(msg.embeds_json) as Array<{
+        type?: string; title?: string; description?: string; url?: string;
+        color?: number; footer?: string; image?: string; thumbnail?: string;
+      }>;
+
+      const stoatEmbeds: Embed[] = [];
+      for (const e of discordEmbeds) {
+        // Skip auto-generated link embeds (type "link" or "video")
+        if (e.type === "link" || e.type === "video" || e.type === "gifv") continue;
+
+        if (e.title || e.description) {
+          stoatEmbeds.push({
+            type: "Text",
+            title: e.title,
+            description: e.description,
+            url: e.url,
+            colour: e.color ? `#${e.color.toString(16).padStart(6, "0")}` : undefined,
+            icon_url: e.thumbnail,
+          });
+        }
+      }
+
+      if (stoatEmbeds.length > 0) {
+        sendOpts.embeds = stoatEmbeds;
+      }
+    } catch {
+      // Malformed JSON
+    }
+  }
+
+  const sent = await stoatClient.sendMessage(channelId, content || " ", sendOpts);
+  result.stoatMsgId = sent._id ?? null;
+  return result;
 }
 
-/** Format a Date as "YYYY-MM-DD HH:MM AM/PM" — locale-independent */
+/** Format a Date as "YYYY-MM-DD HH:MM AM/PM UTC" — locale-independent */
 function formatTimestamp(date: Date): string {
   const y = date.getUTCFullYear();
   const m = String(date.getUTCMonth() + 1).padStart(2, "0");

@@ -657,6 +657,16 @@ export class Store {
       .run(stoatMessageId, id);
   }
 
+  /** Look up the Stoat message ID for an imported archive message by its Discord ID */
+  getImportedStoatId(jobId: string, discordMessageId: string): string | null {
+    const row = this.db
+      .query<{ stoat_message_id: string | null }, [string, string]>(
+        "SELECT stoat_message_id FROM archive_messages WHERE job_id = ? AND discord_message_id = ? LIMIT 1"
+      )
+      .get(jobId, discordMessageId);
+    return row?.stoat_message_id ?? null;
+  }
+
   /** Count total and imported messages for a job */
   getArchiveMessageCounts(jobId: string): { total: number; imported: number } {
     const total = this.db
