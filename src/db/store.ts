@@ -143,6 +143,32 @@ export class Store {
     );
   }
 
+  /** Remove a server link and all associated channel links for a guild */
+  unlinkServer(discordGuildId: string): { channelsRemoved: number } {
+    // First count and remove channel links that belong to this guild's channels
+    // We don't have a guild_id FK on channel_links, so we delete the server link
+    // and leave channel cleanup to the caller (who has access to the Discord client).
+    // However, we can remove all channel links by their IDs if passed.
+    this.db
+      .query("DELETE FROM server_links WHERE discord_guild_id = ?")
+      .run(discordGuildId);
+    // Also remove associated role links
+    this.db
+      .query("DELETE FROM role_links WHERE server_link_guild_id = ?")
+      .run(discordGuildId);
+    return { channelsRemoved: 0 };
+  }
+
+  /** Remove all channel links for a set of Discord channel IDs */
+  unlinkChannels(discordChannelIds: string[]): number {
+    if (discordChannelIds.length === 0) return 0;
+    const placeholders = discordChannelIds.map(() => "?").join(",");
+    const result = this.db
+      .query(`DELETE FROM channel_links WHERE discord_channel_id IN (${placeholders})`)
+      .run(...discordChannelIds);
+    return (result as { changes: number }).changes ?? 0;
+  }
+
   /** Look up a server link by its API token. Returns null if no match. */
   getServerLinkByToken(token: string): ServerLinkRow | null {
     return (

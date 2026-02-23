@@ -711,7 +711,7 @@ async function runMigration(
     const created = await stoatClient.createServer(guild.name, guild.description ?? undefined);
     stoatServerId = created.server._id;
   }
-  store.linkServer(guild.id, stoatServerId, auth.method, userId, auth.stoatUserId ?? undefined);
+  const apiToken = store.linkServer(guild.id, stoatServerId, auth.method, userId, auth.stoatUserId ?? undefined);
 
   if (mode === "categories" && !isDryRun) {
     // Categories-only: just organize existing channels
@@ -886,6 +886,7 @@ async function runMigration(
       { name: "Created", value: `${result.created}`, inline: true },
       { name: "Updated", value: `${result.updated}`, inline: true },
       { name: "Errors", value: `${result.errors.length}`, inline: true },
+      { name: "API Token", value: `\`${apiToken}\`\nUse with \`Authorization: Bearer <token>\` for the archive HTTP API. Regenerate anytime with \`/token regenerate:true\`.` },
     );
 
   if (result.errors.length > 0) {

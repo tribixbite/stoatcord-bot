@@ -49,6 +49,10 @@ export function registerDiscordEvents(
           await handleUnlink(interaction, store);
           break;
 
+        case "unlink-server":
+          await handleUnlinkServer(interaction, store, client);
+          break;
+
         case "status":
           await handleStatus(interaction, store);
           break;
@@ -322,6 +326,64 @@ async function handleUnlink(
     content: `Unlinked from Stoat channel \`${link.stoat_channel_id}\`. Bridging stopped.`,
     ephemeral: true,
   });
+}
+
+/** /unlink-server — remove the guild↔server binding and all channel bridges */
+async function handleUnlinkServer(
+  interaction: ChatInputCommandInteraction,
+  store: Store,
+  client: Client
+): Promise<void> {
+  const guildId = interaction.guildId;
+  if (!guildId) {
+    await interaction.reply({ content: "This command can only be used in a server.", ephemeral: true });
+    return;
+  }
+
+  const confirm = interaction.options.getBoolean("confirm", true);
+  if (!confirm) {
+    await interaction.reply({
+      content: "Set `confirm` to `True` to proceed. This removes the server link and all channel bridges.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const serverLink = store.getServerLink(guildId);
+  if (!serverLink) {
+    await interaction.reply({
+      content: "This server is not linked to any Stoat server.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  // Find all channel bridges belonging to this guild
+  const allLinks = store.getAllActiveChannelLinks();
+  const guildChannelIds = allLinks
+    .filter((link) => {
+      const ch = client.channels.cache.get(link.discord_channel_id);
+      return ch && "guildId" in ch && ch.guildId === guildId;
+    })
+    .map((link) => link.discord_channel_id);
+
+  // Remove channel bridges first, then server link + roles
+  const channelsRemoved = store.unlinkChannels(guildChannelIds);
+  store.unlinkServer(guildId);
+
+  await interaction.editReply({
+    content:
+      `Server link to Stoat \`${serverLink.stoat_server_id}\` removed.\n` +
+      `${channelsRemoved} channel bridge(s) deactivated.\n` +
+      `API token invalidated. Run \`/migrate\` to re-link.`,
+  });
+
+  console.log(
+    `[discord] Server unlink: guild ${guildId} unlinked from Stoat ${serverLink.stoat_server_id}, ` +
+    `${channelsRemoved} channel(s) removed`
+  );
 }
 
 async function handleStatus(

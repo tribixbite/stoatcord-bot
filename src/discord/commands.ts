@@ -95,6 +95,18 @@ export const commands: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setName("unlink-server")
+    .setDescription("Remove the server link between this Discord guild and its Stoat server")
+    .addBooleanOption((opt) =>
+      opt
+        .setName("confirm")
+        .setDescription("Confirm removal — this also removes all channel bridges")
+        .setRequired(true)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .toJSON(),
+
+  new SlashCommandBuilder()
     .setName("status")
     .setDescription("Show bridge status for this server")
     .toJSON(),
