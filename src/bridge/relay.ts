@@ -26,6 +26,14 @@ import {
 const recentBridgedIds = new Set<string>();
 const BRIDGE_ID_TTL = 60_000; // 60 seconds
 
+// Track edit IDs to prevent edit echo loops
+const recentEditIds = new Set<string>();
+const EDIT_ID_TTL = 10_000; // 10 seconds
+
+// Track delete IDs to prevent delete echo loops
+const recentDeleteIds = new Set<string>();
+const DELETE_ID_TTL = 10_000; // 10 seconds
+
 // User cache to avoid repeated API lookups for display names/avatars
 const userCache = new Map<string, { user: User; fetchedAt: number }>();
 const USER_CACHE_TTL = 300_000; // 5 minutes
@@ -56,6 +64,24 @@ function markBridged(id: string): void {
 
 function wasBridged(id: string): boolean {
   return recentBridgedIds.has(id);
+}
+
+function markEdited(id: string): void {
+  recentEditIds.add(id);
+  setTimeout(() => recentEditIds.delete(id), EDIT_ID_TTL);
+}
+
+function wasEdited(id: string): boolean {
+  return recentEditIds.has(id);
+}
+
+function markDeleted(id: string): void {
+  recentDeleteIds.add(id);
+  setTimeout(() => recentDeleteIds.delete(id), DELETE_ID_TTL);
+}
+
+function wasDeleted(id: string): boolean {
+  return recentDeleteIds.has(id);
 }
 
 /**
@@ -188,4 +214,116 @@ export function setupStoatToDiscordRelay(
       console.error("[bridge] Stoat→Discord relay error:", err);
     }
   });
+
+  // --- Stoat→Discord edit sync ---
+  stoatWs.on("messageUpdate", async (event: BonfireMessageUpdateEvent) => {
+    // Skip edits we initiated (from Discord→Stoat edit relay)
+    if (wasEdited(event.id)) return;
+
+    // Only sync content changes
+    if (!event.data.content) return;
+
+    const mapping = store.getBridgeMessageByStoatId(event.id);
+    if (!mapping) return;
+
+    const link = store.getChannelByStoatId(event.channel);
+    if (!link?.discord_webhook_id || !link?.discord_webhook_token) return;
+
+    const content = truncateForDiscord(revoltToDiscord(event.data.content));
+    if (!content) return;
+
+    try {
+      markEdited(mapping.discord_message_id);
+      await editViaWebhook(
+        link.discord_webhook_id,
+        link.discord_webhook_token,
+        mapping.discord_message_id,
+        content
+      );
+    } catch (err) {
+      console.error("[bridge] Stoat→Discord edit sync error:", err);
+    }
+  });
+
+  // --- Stoat→Discord delete sync ---
+  stoatWs.on("messageDelete", async (event: BonfireMessageDeleteEvent) => {
+    // Skip deletes we initiated (from Discord→Stoat delete relay)
+    if (wasDeleted(event.id)) return;
+
+    const mapping = store.getBridgeMessageByStoatId(event.id);
+    if (!mapping) return;
+
+    const link = store.getChannelByStoatId(event.channel);
+    if (!link?.discord_webhook_id || !link?.discord_webhook_token) return;
+
+    try {
+      markDeleted(mapping.discord_message_id);
+      await deleteViaWebhook(
+        link.discord_webhook_id,
+        link.discord_webhook_token,
+        mapping.discord_message_id
+      );
+      store.deleteBridgeMessageByStoatId(event.id);
+    } catch (err) {
+      console.error("[bridge] Stoat→Discord delete sync error:", err);
+    }
+  });
+}
+
+/**
+ * Relay a Discord message edit to the linked Stoat channel.
+ * Called from events.ts on messageUpdate.
+ */
+export async function relayDiscordEditToStoat(
+  messageId: string,
+  newContent: string,
+  store: Store,
+  stoatClient: StoatClient
+): Promise<void> {
+  // Skip edits we initiated (from Stoat→Discord edit relay)
+  if (wasEdited(messageId)) return;
+
+  const mapping = store.getBridgeMessageByDiscordId(messageId);
+  if (!mapping) return;
+
+  const content = truncateForRevolt(discordToRevolt(newContent));
+  if (!content) return;
+
+  try {
+    markEdited(mapping.stoat_message_id);
+    await stoatClient.editMessage(
+      mapping.stoat_channel_id,
+      mapping.stoat_message_id,
+      content
+    );
+  } catch (err) {
+    console.error("[bridge] Discord→Stoat edit sync error:", err);
+  }
+}
+
+/**
+ * Relay a Discord message deletion to the linked Stoat channel.
+ * Called from events.ts on messageDelete.
+ */
+export async function relayDiscordDeleteToStoat(
+  messageId: string,
+  store: Store,
+  stoatClient: StoatClient
+): Promise<void> {
+  // Skip deletes we initiated (from Stoat→Discord delete relay)
+  if (wasDeleted(messageId)) return;
+
+  const mapping = store.getBridgeMessageByDiscordId(messageId);
+  if (!mapping) return;
+
+  try {
+    markDeleted(mapping.stoat_message_id);
+    await stoatClient.deleteMessage(
+      mapping.stoat_channel_id,
+      mapping.stoat_message_id
+    );
+    store.deleteBridgeMessage(messageId);
+  } catch (err) {
+    console.error("[bridge] Discord→Stoat delete sync error:", err);
+  }
 }

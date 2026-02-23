@@ -11,7 +11,11 @@ import {
 import type { Store } from "../db/store.ts";
 import type { StoatClient } from "../stoat/client.ts";
 import { startMigrationWizard, type MigrateMode, type MigrateCommandOptions } from "../migration/wizard.ts";
-import { relayDiscordToStoat } from "../bridge/relay.ts";
+import {
+  relayDiscordToStoat,
+  relayDiscordEditToStoat,
+  relayDiscordDeleteToStoat,
+} from "../bridge/relay.ts";
 import { ensureWebhook } from "../bridge/webhooks.ts";
 
 export function registerDiscordEvents(
@@ -71,6 +75,48 @@ export function registerDiscordEvents(
       await relayDiscordToStoat(message, link.stoat_channel_id, stoatClient, store);
     } catch (err) {
       console.error("[bridge] Discord→Stoat relay error:", err);
+    }
+  });
+
+  // --- Edit sync (Discord → Stoat) ---
+  client.on(Events.MessageUpdate, async (_oldMessage, newMessage) => {
+    // Partial messages need fetching; skip if no content change
+    if (!newMessage.content) return;
+    // Ignore bot edits to prevent loops
+    if (newMessage.author?.bot) return;
+
+    const link = store.getChannelByDiscordId(newMessage.channelId);
+    if (!link) return;
+
+    try {
+      await relayDiscordEditToStoat(
+        newMessage.id,
+        newMessage.content,
+        store,
+        stoatClient
+      );
+    } catch (err) {
+      console.error("[bridge] Discord→Stoat edit relay error:", err);
+    }
+  });
+
+  // --- Delete sync (Discord → Stoat) ---
+  client.on(Events.MessageDelete, async (message) => {
+    try {
+      await relayDiscordDeleteToStoat(message.id, store, stoatClient);
+    } catch (err) {
+      console.error("[bridge] Discord→Stoat delete relay error:", err);
+    }
+  });
+
+  // --- Bulk delete sync (Discord → Stoat) ---
+  client.on(Events.MessageBulkDelete, async (messages) => {
+    for (const message of messages.values()) {
+      try {
+        await relayDiscordDeleteToStoat(message.id, store, stoatClient);
+      } catch (err) {
+        console.error("[bridge] Discord→Stoat bulk delete relay error:", err);
+      }
     }
   });
 
