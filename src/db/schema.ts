@@ -22,6 +22,9 @@ export const SCHEMA_SQL = `
     discord_webhook_id TEXT,
     discord_webhook_token TEXT,
     active INTEGER NOT NULL DEFAULT 1,
+    last_bridged_discord_id TEXT,
+    last_bridged_stoat_id TEXT,
+    last_bridged_at INTEGER,
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
   );
 
@@ -93,6 +96,15 @@ export const SCHEMA_SQL = `
  * V3 migration: add bridge_messages table for edit/delete/reaction sync.
  * Uses CREATE TABLE IF NOT EXISTS so it's idempotent on fresh DBs.
  */
+/**
+ * V4 migration: add outage recovery tracking to channel_links.
+ */
+export const MIGRATIONS_V4: string[] = [
+  "ALTER TABLE channel_links ADD COLUMN last_bridged_discord_id TEXT",
+  "ALTER TABLE channel_links ADD COLUMN last_bridged_stoat_id TEXT",
+  "ALTER TABLE channel_links ADD COLUMN last_bridged_at INTEGER",
+];
+
 export const MIGRATIONS_V3: string[] = [
   `CREATE TABLE IF NOT EXISTS bridge_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,6 +152,9 @@ export interface ChannelLinkRow {
   discord_webhook_id: string | null;
   discord_webhook_token: string | null;
   active: number;
+  last_bridged_discord_id: string | null;
+  last_bridged_stoat_id: string | null;
+  last_bridged_at: number | null;
   created_at: number;
 }
 

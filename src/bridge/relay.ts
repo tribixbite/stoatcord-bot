@@ -178,6 +178,8 @@ export async function relayDiscordToStoat(
       stoatChannelId,
       "d2s"
     );
+    // Track for outage recovery
+    store.updateLastBridged(message.channelId, message.id, sent._id);
   }
 }
 
@@ -285,6 +287,8 @@ export function setupStoatToDiscordRelay(
         event.channel,
         "s2d"
       );
+      // Track for outage recovery
+      store.updateLastBridged(link.discord_channel_id, discordMsgId, event._id);
     } catch (err) {
       console.error("[bridge] Stoat→Discord relay error:", err);
     }

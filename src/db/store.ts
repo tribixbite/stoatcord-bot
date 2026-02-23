@@ -5,6 +5,7 @@ import {
   SCHEMA_SQL,
   MIGRATIONS_V2,
   MIGRATIONS_V3,
+  MIGRATIONS_V4,
   type ServerLinkRow,
   type ChannelLinkRow,
   type RoleLinkRow,
@@ -14,7 +15,7 @@ import {
   type BridgeMessageRow,
 } from "./schema.ts";
 
-const CURRENT_SCHEMA_VERSION = 3;
+const CURRENT_SCHEMA_VERSION = 4;
 
 export class Store {
   private db: Database;
@@ -51,6 +52,10 @@ export class Store {
 
     if (currentVersion < 3) {
       this.runMigrationBatch(MIGRATIONS_V3);
+    }
+
+    if (currentVersion < 4) {
+      this.runMigrationBatch(MIGRATIONS_V4);
     }
 
     this.db
@@ -402,6 +407,21 @@ export class Store {
         "SELECT * FROM migration_log WHERE guild_id = ? ORDER BY created_at DESC"
       )
       .all(guildId);
+  }
+
+  /** Update last-bridged message IDs for outage recovery tracking */
+  updateLastBridged(
+    discordChannelId: string,
+    discordMessageId: string,
+    stoatMessageId: string
+  ): void {
+    this.db
+      .query(
+        `UPDATE channel_links
+         SET last_bridged_discord_id = ?, last_bridged_stoat_id = ?, last_bridged_at = unixepoch()
+         WHERE discord_channel_id = ?`
+      )
+      .run(discordMessageId, stoatMessageId, discordChannelId);
   }
 
   // --- Bridge Messages ---

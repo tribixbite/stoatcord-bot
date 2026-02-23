@@ -11,6 +11,7 @@ import { registerDiscordEvents } from "./discord/events.ts";
 import { StoatClient } from "./stoat/client.ts";
 import { StoatWebSocket } from "./stoat/websocket.ts";
 import { setupStoatToDiscordRelay } from "./bridge/relay.ts";
+import { runOutageRecovery } from "./bridge/recovery.ts";
 import { setupStoatCommands } from "./stoat/commands.ts";
 import { cancelAllPending } from "./migration/approval.ts";
 import { handleListGuilds, handleGuildChannels } from "./api/server.ts";
@@ -62,8 +63,14 @@ async function main(): Promise<void> {
 
   // Connect Stoat WebSocket for realtime events
   const stoatWs = new StoatWebSocket(config.stoatToken, config.stoatWsUrl);
+  // discordClient is set later; use a mutable reference for the recovery closure
+  let discordClientRef: ReturnType<typeof createDiscordClient> | null = null;
   stoatWs.on("ready", () => {
     console.log("[stoat-ws] Ready — listening for messages");
+    // Run outage recovery on connect/reconnect
+    runOutageRecovery(store, stoatClient, discordClientRef, config.stoatCdnUrl).catch((err) => {
+      console.error("[recovery] Outage recovery failed:", err);
+    });
   });
   stoatWs.connect();
 
@@ -125,6 +132,7 @@ async function main(): Promise<void> {
   let discordClient: ReturnType<typeof createDiscordClient> | null = null;
   try {
     discordClient = createDiscordClient();
+    discordClientRef = discordClient;
 
     // Set up Stoat-side command handler (!stoatcord code, request, status, help)
     // and reply-based migration approval detection
