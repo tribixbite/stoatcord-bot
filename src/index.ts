@@ -333,6 +333,7 @@ async function main(): Promise<void> {
                 },
                 stoat: {
                   wsConnected: stoatWs.isConnected(),
+                  wsDebug: stoatWs.getDebugState(),
                 },
                 links: {
                   total: store.getAllActiveChannelLinks().length,

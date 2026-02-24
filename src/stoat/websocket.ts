@@ -39,6 +39,7 @@ export class StoatWebSocket {
   private lastPongAt = 0;
   private lastEventAt = 0;
   private pongCount = 0;
+  private messageCount = 0;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private shouldReconnect = true;
@@ -74,6 +75,27 @@ export class StoatWebSocket {
   /** Check if WebSocket is currently connected */
   isConnected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  /** Debug state for diagnostics endpoint */
+  getDebugState(): {
+    connected: boolean;
+    readyState: number;
+    pongCount: number;
+    lastPongAgo: number;
+    lastEventAgo: number;
+    reconnectAttempts: number;
+    messageCount: number;
+  } {
+    return {
+      connected: this.ws?.readyState === WebSocket.OPEN,
+      readyState: this.ws?.readyState ?? -1,
+      pongCount: this.pongCount,
+      lastPongAgo: this.lastPongAt > 0 ? Math.round((Date.now() - this.lastPongAt) / 1000) : -1,
+      lastEventAgo: this.lastEventAt > 0 ? Math.round((Date.now() - this.lastEventAt) / 1000) : -1,
+      reconnectAttempts: this.reconnectAttempts,
+      messageCount: this.messageCount,
+    };
   }
 
   /** Connect to the Bonfire WebSocket */
@@ -183,9 +205,10 @@ export class StoatWebSocket {
         break;
 
       case "Message": {
+        this.messageCount++;
         const msg = data as unknown as BonfireMessageEvent;
         console.log(
-          `[stoat-ws] Message in ${msg.channel} from ${msg.author}` +
+          `[stoat-ws] Message #${this.messageCount} in ${msg.channel} from ${msg.author}` +
             (msg.masquerade ? " [masq]" : "") +
             (msg.content ? ` — "${msg.content.slice(0, 80)}"` : " (no content)")
         );
