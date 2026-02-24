@@ -11,6 +11,7 @@ import type { StoatWebSocket } from "./websocket.ts";
 import type { BonfireMessageEvent } from "./types.ts";
 import { PermissionBit } from "./types.ts";
 import type { Store } from "../db/store.ts";
+import type { PushStore } from "../push/store.ts";
 import { resolveApproval, rejectApproval } from "../migration/approval.ts";
 
 const COMMAND_PREFIX = "!stoatcord";
@@ -97,7 +98,8 @@ export function setupStoatCommands(
   store: Store,
   stoatClient: StoatClient,
   botUserId: string,
-  discordClient: DiscordClient
+  discordClient: DiscordClient,
+  pushStore?: PushStore
 ): void {
   stoatWs.on("message", async (event: BonfireMessageEvent) => {
     // Skip messages from the bot itself
@@ -137,6 +139,9 @@ export function setupStoatCommands(
         break;
       case "archive":
         await handleArchiveCommand(event, serverId, stoatClient, store);
+        break;
+      case "push":
+        await handlePushCommand(event, parsed.args, stoatClient, store, pushStore);
         break;
       case "help":
         await handleHelpCommand(event, stoatClient);
@@ -475,12 +480,143 @@ async function handleHelpCommand(
     `\`!stoatcord status\` — Show bridge link status\n\n` +
     `**Archive:**\n` +
     `\`!stoatcord archive\` — Show archive job status for the linked Discord guild\n\n` +
+    `**Push Notifications:**\n` +
+    `\`!stoatcord push setup\` — Generate a push token (sent via DM)\n` +
+    `\`!stoatcord push revoke\` — Revoke token and unregister all devices\n` +
+    `\`!stoatcord push status\` — Check your push registration status\n\n` +
     `**Diagnostics:**\n` +
     `\`!stoatcord ping <user_id>\` — Send a mention to test push notifications\n` +
     `\`!stoatcord diag\` — Run notification diagnostics\n` +
     `\`!stoatcord help\` — Show this message`,
     { replies: [{ id: event._id, mention: false }] }
   );
+}
+
+/**
+ * !stoatcord push <subcommand> — manage push notification tokens via DM.
+ * Subcommands: setup, revoke, status
+ */
+async function handlePushCommand(
+  event: BonfireMessageEvent,
+  args: string[],
+  stoatClient: StoatClient,
+  store: Store,
+  pushStore?: PushStore
+): Promise<void> {
+  const subcommand = args[0]?.toLowerCase();
+
+  if (!subcommand || subcommand === "help") {
+    await stoatClient.sendMessage(
+      event.channel,
+      `**Push Notification Commands**\n\n` +
+      `\`!stoatcord push setup\` — Generate a push token (sent via DM)\n` +
+      `\`!stoatcord push revoke\` — Revoke your push token and unregister all devices\n` +
+      `\`!stoatcord push status\` — Check your push registration status\n\n` +
+      `**How it works:**\n` +
+      `1. Run \`!stoatcord push setup\` — the bot DMs you a push token\n` +
+      `2. In your app, go to Settings > Notifications > API Key\n` +
+      `3. Paste the token and tap Save\n` +
+      `4. Your device will register for push notifications automatically`,
+      { replies: [{ id: event._id, mention: false }] }
+    );
+    return;
+  }
+
+  switch (subcommand) {
+    case "setup": {
+      // Generate a push token and DM it to the user
+      const token = store.createPushToken(event.author);
+
+      // Open DM channel and send the token privately
+      try {
+        const dmChannel = await stoatClient.openDM(event.author);
+        await stoatClient.sendMessage(
+          dmChannel._id,
+          `**Your Push Notification Token**\n\n` +
+          `\`${token}\`\n\n` +
+          `Paste this into your app's **Settings > Notifications > API Key** field and tap Save.\n\n` +
+          `This token is tied to your account. Keep it private — anyone with it can register devices for your push notifications.\n` +
+          `Use \`!stoatcord push revoke\` to invalidate it at any time.`
+        );
+
+        // Confirm in the original channel (without leaking the token)
+        await stoatClient.sendMessage(
+          event.channel,
+          `Push token generated and sent to your DMs. Check your direct messages.`,
+          { replies: [{ id: event._id, mention: false }] }
+        );
+      } catch (err) {
+        console.error(`[stoat-cmd] Failed to DM push token to user ${event.author}:`, err);
+        await stoatClient.sendMessage(
+          event.channel,
+          `Failed to send DM. Make sure the bot can message you (you may need to share a server or have DMs enabled).`,
+          { replies: [{ id: event._id, mention: false }] }
+        );
+        // Revoke the token since it was never delivered
+        store.revokePushTokens(event.author);
+      }
+
+      console.log(`[stoat-cmd] Push token generated for user ${event.author}`);
+      break;
+    }
+
+    case "revoke": {
+      const deleted = store.revokePushTokens(event.author);
+
+      // Also unregister all push devices for this user
+      if (pushStore) {
+        const removed = pushStore.removeAllDevicesForUser(event.author);
+        await stoatClient.sendMessage(
+          event.channel,
+          deleted > 0
+            ? `Push token revoked and ${removed} device(s) unregistered. You will no longer receive push notifications until you run \`!stoatcord push setup\` again.`
+            : `You don't have an active push token.`,
+          { replies: [{ id: event._id, mention: false }] }
+        );
+      } else {
+        await stoatClient.sendMessage(
+          event.channel,
+          deleted > 0
+            ? `Push token revoked. You will no longer receive push notifications until you run \`!stoatcord push setup\` again.`
+            : `You don't have an active push token.`,
+          { replies: [{ id: event._id, mention: false }] }
+        );
+      }
+
+      console.log(`[stoat-cmd] Push token revoked for user ${event.author} (deleted=${deleted})`);
+      break;
+    }
+
+    case "status": {
+      const hasToken = store.hasPushToken(event.author);
+      const devices = pushStore?.getDevicesByUserId(event.author) ?? [];
+
+      let statusMsg = `**Push Status**\n\n`;
+      statusMsg += `Token: ${hasToken ? "Active" : "None"}\n`;
+      statusMsg += `Registered devices: ${devices.length}\n`;
+
+      if (devices.length > 0) {
+        statusMsg += `\n**Devices:**\n`;
+        for (const d of devices) {
+          const mode = d.push_mode === "fcm" ? "FCM" : "WebPush";
+          const ago = Math.round((Date.now() / 1000 - d.updated_at) / 60);
+          statusMsg += `- \`${d.device_id.slice(0, 8)}...\` (${mode}) — updated ${ago}m ago\n`;
+        }
+      }
+
+      await stoatClient.sendMessage(event.channel, statusMsg, {
+        replies: [{ id: event._id, mention: false }],
+      });
+      break;
+    }
+
+    default:
+      await stoatClient.sendMessage(
+        event.channel,
+        `Unknown push subcommand \`${subcommand}\`. Use \`!stoatcord push help\` for options.`,
+        { replies: [{ id: event._id, mention: false }] }
+      );
+  }
 }
 
 // --- Reply-based approval detection ---

@@ -141,7 +141,7 @@ async function main(): Promise<void> {
 
     // Set up Stoat-side command handler (!stoatcord code, request, status, help)
     // and reply-based migration approval detection
-    setupStoatCommands(stoatWs, store, stoatClient, botSelfId, discordClient);
+    setupStoatCommands(stoatWs, store, stoatClient, botSelfId, discordClient, pushStore);
 
     // Set up Stoat→Discord message relay (includes typing, reactions, channel metadata sync)
     setupStoatToDiscordRelay(stoatWs, store, config.stoatCdnUrl, stoatClient, discordClient);
@@ -183,12 +183,29 @@ async function main(): Promise<void> {
       const method = req.method;
 
       // Auth check — require API key if configured
-      // Only /api/health is exempt (returns minimal status for uptime monitors)
-      if (apiKey && url.pathname !== "/api/health" && req.headers.get("x-api-key") !== apiKey) {
-        return Response.json({ error: "Unauthorized" }, {
-          status: 401,
-          headers: corsHeaders,
-        });
+      // /api/health is exempt (uptime monitors)
+      // Push endpoints (/api/push/*) accept either admin API key or per-user push token
+      const reqApiKey = req.headers.get("x-api-key") ?? "";
+      const isPushEndpoint = url.pathname.startsWith("/api/push/");
+      const isAdminAuthed = apiKey && reqApiKey === apiKey;
+      let pushTokenUserId: string | null = null; // set when authed via push token
+
+      if (url.pathname !== "/api/health") {
+        if (isPushEndpoint && !isAdminAuthed) {
+          // Try per-user push token auth
+          pushTokenUserId = reqApiKey ? store.getPushTokenUser(reqApiKey) : null;
+          if (!pushTokenUserId) {
+            return Response.json({ error: "Unauthorized" }, {
+              status: 401,
+              headers: corsHeaders,
+            });
+          }
+        } else if (apiKey && !isAdminAuthed) {
+          return Response.json({ error: "Unauthorized" }, {
+            status: 401,
+            headers: corsHeaders,
+          });
+        }
       }
 
       // CORS preflight
@@ -423,11 +440,15 @@ async function main(): Promise<void> {
               );
             }
           }
+          // When authed via push token, enforce user scoping — override the userId
+          // to prevent registering devices under a different user
+          const effectiveUserId = pushTokenUserId ?? body.userId;
+
           // p256dh and auth are optional — UnifiedPush distributors like ntfy
           // don't provide WebPush encryption keys, so relay.ts falls back to
           // plain HTTP POST for endpoints without them
           pushStore.registerDevice({
-            stoatUserId: body.userId,
+            stoatUserId: effectiveUserId,
             deviceId: body.deviceId,
             pushMode: body.mode,
             fcmToken: body.fcmToken,
@@ -436,7 +457,7 @@ async function main(): Promise<void> {
             webpushAuth: body.auth,
           });
           console.log(
-            `[push] Registered device ${body.deviceId} (${body.mode}) for user ${body.userId}`
+            `[push] Registered device ${body.deviceId} (${body.mode}) for user ${effectiveUserId}${pushTokenUserId ? " (token-authed)" : ""}`
           );
           return addHeaders(
             Response.json({ ok: true, mode: body.mode }),
@@ -453,9 +474,20 @@ async function main(): Promise<void> {
               { status: 400, headers: corsHeaders }
             );
           }
+          // When authed via push token, verify the device belongs to this user
+          if (pushTokenUserId) {
+            const device = pushStore.getDeviceByDeviceId(body.deviceId);
+            if (device && device.stoat_user_id !== pushTokenUserId) {
+              return Response.json(
+                { error: "Device does not belong to your account" },
+                { status: 403, headers: corsHeaders }
+              );
+            }
+          }
+
           const removed = pushStore.unregisterDevice(body.deviceId);
           console.log(
-            `[push] Unregistered device ${body.deviceId}: ${removed ? "found" : "not found"}`
+            `[push] Unregistered device ${body.deviceId}: ${removed ? "found" : "not found"}${pushTokenUserId ? " (token-authed)" : ""}`
           );
           return addHeaders(
             Response.json({ ok: true, removed }),
@@ -473,6 +505,15 @@ async function main(): Promise<void> {
             );
           }
           const device = pushStore.getDeviceByDeviceId(deviceId);
+
+          // When authed via push token, only show the user's own device
+          if (pushTokenUserId && device && device.stoat_user_id !== pushTokenUserId) {
+            return addHeaders(
+              Response.json({ registered: false, mode: null, updatedAt: null }),
+              corsHeaders
+            );
+          }
+
           return addHeaders(
             Response.json({
               registered: device !== null,

@@ -125,6 +125,13 @@ export const SCHEMA_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_archive_msgs_job ON archive_messages(job_id);
   CREATE UNIQUE INDEX IF NOT EXISTS idx_archive_msgs_unique ON archive_messages(job_id, discord_message_id);
+
+  CREATE TABLE IF NOT EXISTS push_tokens (
+    token TEXT PRIMARY KEY,
+    stoat_user_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+  CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(stoat_user_id);
 `;
 
 /**
@@ -221,6 +228,25 @@ export const MIGRATIONS_V2: string[] = [
   "ALTER TABLE migration_log ADD COLUMN discord_user_id TEXT",
   "ALTER TABLE migration_log ADD COLUMN stoat_user_id TEXT",
 ];
+
+/**
+ * V7 migration: push_tokens table for per-user push API authentication.
+ * Users generate tokens via DM commands; tokens scope push API access to their user ID.
+ */
+export const MIGRATIONS_V7: string[] = [
+  `CREATE TABLE IF NOT EXISTS push_tokens (
+    token TEXT PRIMARY KEY,
+    stoat_user_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(stoat_user_id)`,
+];
+
+export interface PushTokenRow {
+  token: string;
+  stoat_user_id: string;
+  created_at: number;
+}
 
 // Row types for query results
 

@@ -52,6 +52,11 @@ export class StoatClient {
     return this.request<User>("GET", `/users/${userId}`);
   }
 
+  /** Open (or get existing) DM channel with a user. Returns the DM channel object. */
+  async openDM(userId: string): Promise<Channel> {
+    return this.request<Channel>("GET", `/users/${userId}/dm`);
+  }
+
   // --- Servers ---
 
   async createServer(

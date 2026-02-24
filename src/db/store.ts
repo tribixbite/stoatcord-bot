@@ -8,6 +8,7 @@ import {
   MIGRATIONS_V4,
   MIGRATIONS_V5,
   MIGRATIONS_V6,
+  MIGRATIONS_V7,
   type ServerLinkRow,
   type ChannelLinkRow,
   type RoleLinkRow,
@@ -17,9 +18,10 @@ import {
   type BridgeMessageRow,
   type ArchiveJobRow,
   type ArchiveMessageRow,
+  type PushTokenRow,
 } from "./schema.ts";
 
-const CURRENT_SCHEMA_VERSION = 6;
+const CURRENT_SCHEMA_VERSION = 7;
 
 export class Store {
   private db: Database;
@@ -68,6 +70,10 @@ export class Store {
 
     if (currentVersion < 6) {
       this.runMigrationBatch(MIGRATIONS_V6);
+    }
+
+    if (currentVersion < 7) {
+      this.runMigrationBatch(MIGRATIONS_V7);
     }
 
     this.db
@@ -757,6 +763,49 @@ export class Store {
       .get(jobId)?.count ?? 0;
     return { total, imported };
   }
+
+  // --- Push Tokens (per-user push API auth) ---
+
+  /** Create a push token for a user. Revokes any existing token for that user first. */
+  createPushToken(stoatUserId: string): string {
+    // One token per user — revoke old ones
+    this.db
+      .query("DELETE FROM push_tokens WHERE stoat_user_id = ?")
+      .run(stoatUserId);
+    const token = generatePushToken();
+    this.db
+      .query("INSERT INTO push_tokens (token, stoat_user_id) VALUES (?, ?)")
+      .run(token, stoatUserId);
+    return token;
+  }
+
+  /** Look up a push token. Returns the associated user ID if valid. */
+  getPushTokenUser(token: string): string | null {
+    const row = this.db
+      .query<PushTokenRow, [string]>(
+        "SELECT * FROM push_tokens WHERE token = ?"
+      )
+      .get(token);
+    return row?.stoat_user_id ?? null;
+  }
+
+  /** Revoke all push tokens for a user. Returns count deleted. */
+  revokePushTokens(stoatUserId: string): number {
+    const result = this.db
+      .query("DELETE FROM push_tokens WHERE stoat_user_id = ?")
+      .run(stoatUserId);
+    return (result as { changes: number }).changes;
+  }
+
+  /** Check if a user has an active push token */
+  hasPushToken(stoatUserId: string): boolean {
+    const row = this.db
+      .query<{ count: number }, [string]>(
+        "SELECT COUNT(*) as count FROM push_tokens WHERE stoat_user_id = ?"
+      )
+      .get(stoatUserId);
+    return (row?.count ?? 0) > 0;
+  }
 }
 
 /** Generate a 6-char alphanumeric claim code using crypto-secure randomness */
@@ -769,6 +818,17 @@ function generateCode(): string {
     code += chars[randomBytes[i]! % chars.length];
   }
   return code;
+}
+
+/** Generate a 44-char base64url push token for per-user push API authentication */
+function generatePushToken(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  // base64url encoding (no padding, URL-safe)
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
 }
 
 /** Generate a 32-char hex API token for per-guild API authentication */
