@@ -524,11 +524,11 @@ async function handlePushCommand(
 
   switch (subcommand) {
     case "setup": {
-      // Generate a push token and DM it to the user
-      const token = store.createPushToken(event.author);
-
-      // Open DM channel and send the token privately
       try {
+        // Generate token inside try block to catch DB errors
+        const token = store.createPushToken(event.author);
+
+        // Open DM channel and send the token privately
         const dmChannel = await stoatClient.openDM(event.author);
         await stoatClient.sendMessage(
           dmChannel._id,
@@ -545,18 +545,18 @@ async function handlePushCommand(
           `Push token generated and sent to your DMs. Check your direct messages.`,
           { replies: [{ id: event._id, mention: false }] }
         );
+
+        console.log(`[stoat-cmd] Push token generated for user ${event.author}`);
       } catch (err) {
-        console.error(`[stoat-cmd] Failed to DM push token to user ${event.author}:`, err);
+        console.error(`[stoat-cmd] Failed to setup push for user ${event.author}:`, err);
+        // Revoke the token if it was created but DM delivery failed
+        store.revokePushTokens(event.author);
         await stoatClient.sendMessage(
           event.channel,
-          `Failed to send DM. Make sure the bot can message you (you may need to share a server or have DMs enabled).`,
+          `Failed to generate or deliver push token. Make sure the bot can message you (you may need to share a server or have DMs enabled).`,
           { replies: [{ id: event._id, mention: false }] }
         );
-        // Revoke the token since it was never delivered
-        store.revokePushTokens(event.author);
       }
-
-      console.log(`[stoat-cmd] Push token generated for user ${event.author}`);
       break;
     }
 

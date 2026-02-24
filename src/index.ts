@@ -190,7 +190,7 @@ async function main(): Promise<void> {
       const isAdminAuthed = apiKey && reqApiKey === apiKey;
       let pushTokenUserId: string | null = null; // set when authed via push token
 
-      if (url.pathname !== "/api/health") {
+      if (url.pathname !== "/api/health" && url.pathname !== "/api/push/vapid") {
         if (isPushEndpoint && !isAdminAuthed) {
           // Try per-user push token auth
           pushTokenUserId = reqApiKey ? store.getPushTokenUser(reqApiKey) : null;

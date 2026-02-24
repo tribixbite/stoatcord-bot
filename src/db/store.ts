@@ -768,14 +768,16 @@ export class Store {
 
   /** Create a push token for a user. Revokes any existing token for that user first. */
   createPushToken(stoatUserId: string): string {
-    // One token per user — revoke old ones
-    this.db
-      .query("DELETE FROM push_tokens WHERE stoat_user_id = ?")
-      .run(stoatUserId);
     const token = generatePushToken();
-    this.db
-      .query("INSERT INTO push_tokens (token, stoat_user_id) VALUES (?, ?)")
-      .run(token, stoatUserId);
+    // Atomic replace — transaction prevents concurrent calls from creating duplicates
+    this.db.transaction(() => {
+      this.db
+        .query("DELETE FROM push_tokens WHERE stoat_user_id = ?")
+        .run(stoatUserId);
+      this.db
+        .query("INSERT INTO push_tokens (token, stoat_user_id) VALUES (?, ?)")
+        .run(token, stoatUserId);
+    })();
     return token;
   }
 
