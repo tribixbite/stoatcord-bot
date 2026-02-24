@@ -38,6 +38,7 @@ export class StoatWebSocket {
   private livenessInterval: ReturnType<typeof setInterval> | null = null;
   private lastPongAt = 0;
   private lastEventAt = 0;
+  private pongCount = 0;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private shouldReconnect = true;
@@ -148,11 +149,15 @@ export class StoatWebSocket {
         break;
 
       case "Ready": {
-        // Log server/channel count from Ready payload for debugging
+        // Log server/channel count and names from Ready payload for debugging
         const servers = (data as any).servers ?? [];
         const channels = (data as any).channels ?? [];
+        const serverNames = servers.map((s: any) => `${s.name} (${s._id})`).join(", ");
         console.log(
-          `[stoat-ws] Ready event received — ${servers.length} server(s), ${channels.length} channel(s)`
+          `[stoat-ws] Ready — ${servers.length} server(s): ${serverNames}`
+        );
+        console.log(
+          `[stoat-ws] Ready — ${channels.length} channel(s) subscribed`
         );
         for (const handler of this.handlers.ready) {
           handler(data);
@@ -161,8 +166,12 @@ export class StoatWebSocket {
       }
 
       case "Pong":
-        // Log pong receipt for liveness debugging
         this.lastPongAt = Date.now();
+        this.pongCount = (this.pongCount ?? 0) + 1;
+        // Log every 10th pong (~5 min) to confirm connection is alive
+        if (this.pongCount % 10 === 0) {
+          console.log(`[stoat-ws] Pong #${this.pongCount} — connection alive`);
+        }
         break;
 
       case "Message": {
