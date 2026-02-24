@@ -35,6 +35,9 @@ export class StoatWebSocket {
   private wsUrl: string;
   private ws: WebSocket | null = null;
   private pingInterval: ReturnType<typeof setInterval> | null = null;
+  private livenessInterval: ReturnType<typeof setInterval> | null = null;
+  private lastPongAt = 0;
+  private lastEventAt = 0;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private shouldReconnect = true;
@@ -91,12 +94,27 @@ export class StoatWebSocket {
 
     this.ws.onmessage = (event) => {
       try {
-        const data = JSON.parse(event.data as string);
+        const raw = event.data as string;
+        const data = JSON.parse(raw);
+        // Debug: log every raw event type received
+        if (data.type !== "Pong") {
+          console.log(`[stoat-ws] <<< ${data.type} (${raw.length} bytes)`);
+        }
         this.handleEvent(data);
       } catch (e) {
         console.error("[stoat-ws] Failed to parse message:", e);
       }
     };
+
+    // Bun WebSocket may not auto-respond to RFC 6455 ping frames.
+    // Attach a low-level ping handler if available (ws-compatible API).
+    const wsAny = this.ws as any;
+    if (typeof wsAny.on === "function") {
+      wsAny.on("ping", (data: Buffer) => {
+        console.log("[stoat-ws] Received RFC 6455 ping, sending pong");
+        wsAny.pong?.(data);
+      });
+    }
 
     this.ws.onclose = (event) => {
       console.log(
@@ -122,6 +140,7 @@ export class StoatWebSocket {
   }
 
   private handleEvent(data: { type: string; [key: string]: unknown }): void {
+    this.lastEventAt = Date.now();
     switch (data.type) {
       case "Authenticated":
         console.log("[stoat-ws] Authenticated successfully");
@@ -142,7 +161,8 @@ export class StoatWebSocket {
       }
 
       case "Pong":
-        // Expected response to our Ping
+        // Log pong receipt for liveness debugging
+        this.lastPongAt = Date.now();
         break;
 
       case "Message": {
@@ -204,9 +224,32 @@ export class StoatWebSocket {
   /** Send a ping every 30 seconds to keep the connection alive */
   private startPing(): void {
     this.stopPing();
+    this.lastPongAt = Date.now();
+    this.lastEventAt = Date.now();
+
     this.pingInterval = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ type: "Ping", data: Date.now() }));
+      }
+    }, 30_000);
+
+    // Liveness monitor: warn if no events received for 90 seconds
+    this.livenessInterval = setInterval(() => {
+      const sincePong = Date.now() - this.lastPongAt;
+      const sinceEvent = Date.now() - this.lastEventAt;
+      if (sincePong > 90_000) {
+        console.warn(
+          `[stoat-ws] LIVENESS: No Pong in ${Math.round(sincePong / 1000)}s — connection may be dead`
+        );
+        // Force reconnect if no pong for 2+ minutes
+        if (sincePong > 120_000) {
+          console.warn("[stoat-ws] LIVENESS: Forcing reconnect due to missing Pong");
+          this.ws?.close(4000, "Pong timeout");
+        }
+      } else if (sinceEvent > 90_000) {
+        console.log(
+          `[stoat-ws] LIVENESS: No events in ${Math.round(sinceEvent / 1000)}s (last Pong ${Math.round(sincePong / 1000)}s ago)`
+        );
       }
     }, 30_000);
   }
@@ -215,6 +258,10 @@ export class StoatWebSocket {
     if (this.pingInterval) {
       clearInterval(this.pingInterval);
       this.pingInterval = null;
+    }
+    if (this.livenessInterval) {
+      clearInterval(this.livenessInterval);
+      this.livenessInterval = null;
     }
   }
 
