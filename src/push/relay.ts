@@ -22,6 +22,35 @@ interface CachedChannel {
 const USER_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const CHANNEL_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 
+/** Validate push endpoint URL to prevent SSRF attacks */
+function isAllowedPushEndpoint(endpoint: string): boolean {
+  try {
+    const url = new URL(endpoint);
+    // Must be HTTPS (allow HTTP only for well-known UP distributors)
+    if (url.protocol !== "https:") return false;
+    // Block loopback, link-local, and private IP ranges
+    const host = url.hostname.toLowerCase();
+    if (
+      host === "localhost" ||
+      host === "127.0.0.1" ||
+      host === "::1" ||
+      host === "0.0.0.0" ||
+      host.startsWith("10.") ||
+      host.startsWith("172.16.") || host.startsWith("172.17.") || host.startsWith("172.18.") ||
+      host.startsWith("172.19.") || host.startsWith("172.2") || host.startsWith("172.3") ||
+      host.startsWith("192.168.") ||
+      host.startsWith("169.254.") || // link-local / cloud metadata
+      host.endsWith(".internal") ||
+      host.endsWith(".local")
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Set up the push notification relay.
  * Hooks into Stoat WebSocket message events and routes notifications
@@ -192,6 +221,13 @@ export function setupPushRelay(opts: {
             }
           } else {
             // Plain HTTP POST for UP endpoints without encryption keys (e.g., ntfy)
+            // Validate endpoint URL to prevent SSRF attacks
+            if (!isAllowedPushEndpoint(device.webpush_endpoint)) {
+              console.warn(
+                `[push:relay] Blocked unsafe UP endpoint for ${device.device_id}: ${device.webpush_endpoint.slice(0, 60)}`
+              );
+              continue;
+            }
             try {
               const res = await fetch(device.webpush_endpoint, {
                 method: "POST",

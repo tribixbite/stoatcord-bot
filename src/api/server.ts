@@ -94,7 +94,7 @@ export async function handleGuildChannels(
     await guild.roles.fetch();
   } catch (err) {
     return Response.json(
-      { error: `Failed to fetch guild data: ${err}` },
+      { error: "Failed to fetch guild data" },
       { status: 502 }
     );
   }

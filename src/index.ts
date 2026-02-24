@@ -164,9 +164,14 @@ async function main(): Promise<void> {
   // Start HTTP API server for Stoat app integration
   const apiPort = parseInt(process.env["PORT"] || process.env["API_PORT"] || "3210", 10);
   const apiKey = process.env["API_KEY"] || "";
+  if (!apiKey) {
+    console.warn("[api] WARNING: API_KEY is not set — all endpoints are unauthenticated!");
+  }
 
+  // CORS: restrict to known origins in production, allow all in dev
+  const allowedOrigins = process.env["CORS_ORIGINS"]?.split(",") ?? ["*"];
   const corsHeaders: Record<string, string> = {
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin": allowedOrigins[0]!,
     "Access-Control-Allow-Headers": "x-api-key, content-type, authorization",
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
   };
@@ -177,8 +182,9 @@ async function main(): Promise<void> {
       const url = new URL(req.url);
       const method = req.method;
 
-      // Auth check — require API key if configured (exempt healthcheck endpoint)
-      if (apiKey && url.pathname !== "/api/diag" && req.headers.get("x-api-key") !== apiKey) {
+      // Auth check — require API key if configured
+      // Only /api/health is exempt (returns minimal status for uptime monitors)
+      if (apiKey && url.pathname !== "/api/health" && req.headers.get("x-api-key") !== apiKey) {
         return Response.json({ error: "Unauthorized" }, {
           status: 401,
           headers: corsHeaders,
@@ -188,6 +194,14 @@ async function main(): Promise<void> {
       // CORS preflight
       if (method === "OPTIONS") {
         return new Response(null, { status: 204, headers: corsHeaders });
+      }
+
+      // Route: GET /api/health — minimal unauthenticated healthcheck
+      if (url.pathname === "/api/health" && method === "GET") {
+        return addHeaders(
+          Response.json({ status: "ok" }),
+          corsHeaders
+        );
       }
 
       try {
@@ -309,7 +323,7 @@ async function main(): Promise<void> {
             );
           } catch (err) {
             return Response.json(
-              { error: `Failed to send: ${err}` },
+              { error: "Failed to send test notification" },
               { status: 500, headers: corsHeaders }
             );
           }
@@ -349,7 +363,7 @@ async function main(): Promise<void> {
             );
           } catch (err) {
             return Response.json(
-              { error: `Diagnostics failed: ${err}` },
+              { error: "Diagnostics unavailable" },
               { status: 500, headers: corsHeaders }
             );
           }
@@ -385,6 +399,29 @@ async function main(): Promise<void> {
               { error: "endpoint required for WebPush mode" },
               { status: 400, headers: corsHeaders }
             );
+          }
+          // Validate webpush endpoint URL to prevent SSRF
+          if (body.mode === "webpush" && body.endpoint) {
+            try {
+              const epUrl = new URL(body.endpoint);
+              const host = epUrl.hostname.toLowerCase();
+              if (
+                epUrl.protocol !== "https:" ||
+                host === "localhost" || host === "127.0.0.1" || host === "::1" ||
+                host.startsWith("10.") || host.startsWith("192.168.") ||
+                host.startsWith("169.254.") || host.endsWith(".internal") || host.endsWith(".local")
+              ) {
+                return Response.json(
+                  { error: "Invalid webpush endpoint — must be a public HTTPS URL" },
+                  { status: 400, headers: corsHeaders }
+                );
+              }
+            } catch {
+              return Response.json(
+                { error: "Invalid webpush endpoint URL" },
+                { status: 400, headers: corsHeaders }
+              );
+            }
           }
           // p256dh and auth are optional — UnifiedPush distributors like ntfy
           // don't provide WebPush encryption keys, so relay.ts falls back to
