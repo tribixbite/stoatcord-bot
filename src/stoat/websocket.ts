@@ -159,6 +159,14 @@ export class StoatWebSocket {
         console.log(
           `[stoat-ws] Ready — ${channels.length} channel(s) subscribed`
         );
+
+        // Subscribe to each server for full event delivery (Bonfire protocol)
+        for (const server of servers) {
+          const subMsg = JSON.stringify({ type: "Subscribe", server_id: server._id });
+          this.ws?.send(subMsg);
+          console.log(`[stoat-ws] Subscribed to server: ${server.name} (${server._id})`);
+        }
+
         for (const handler of this.handlers.ready) {
           handler(data);
         }
