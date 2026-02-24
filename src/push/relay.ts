@@ -49,11 +49,21 @@ export function setupPushRelay(opts: {
   });
 
   async function handleMessage(event: BonfireMessageEvent): Promise<void> {
+    console.log(
+      `[push:relay] Processing message ${event._id} from ${event.author} in ${event.channel}`
+    );
+
     // Skip messages from the bot itself
-    if (event.author === botSelfId) return;
+    if (event.author === botSelfId) {
+      console.log("[push:relay] Skipped — bot's own message");
+      return;
+    }
 
     // Skip masqueraded messages (bridged from Discord)
-    if (event.masquerade) return;
+    if (event.masquerade) {
+      console.log("[push:relay] Skipped — masqueraded (bridged) message");
+      return;
+    }
 
     // Determine which users should receive push notifications
     const targetUserIds = new Set<string>();
@@ -65,11 +75,15 @@ export function setupPushRelay(opts: {
       while ((match = mentionRegex.exec(event.content)) !== null) {
         targetUserIds.add(match[1]!);
       }
+      console.log(
+        `[push:relay] Content mentions: ${targetUserIds.size} user(s) — content: "${event.content.slice(0, 100)}"`
+      );
     }
 
     // Check if this is a DM/Group channel — notify all recipients
     const channel = await getChannel(event.channel);
     if (channel) {
+      console.log(`[push:relay] Channel type: ${channel.channel_type}`);
       if (
         channel.channel_type === "DirectMessage" ||
         channel.channel_type === "Group"
@@ -90,7 +104,10 @@ export function setupPushRelay(opts: {
     }
 
     // No targets — skip (server messages without mentions)
-    if (targetUserIds.size === 0) return;
+    if (targetUserIds.size === 0) {
+      console.log("[push:relay] Skipped — no target users (no mentions, not a DM)");
+      return;
+    }
 
     // Remove the sender from targets (don't notify yourself)
     targetUserIds.delete(event.author);
@@ -130,9 +147,11 @@ export function setupPushRelay(opts: {
     });
 
     // Send to each target user's registered devices
+    console.log(`[push:relay] Sending to ${targetUserIds.size} target user(s): ${[...targetUserIds].join(", ")}`);
     let sentCount = 0;
     for (const userId of targetUserIds) {
       const devices = pushStore.getDevicesByUserId(userId);
+      console.log(`[push:relay] User ${userId}: ${devices.length} device(s) registered`);
       if (devices.length === 0) continue;
 
       for (const device of devices) {

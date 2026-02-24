@@ -128,22 +128,35 @@ export class StoatWebSocket {
         this.startPing();
         break;
 
-      case "Ready":
-        console.log("[stoat-ws] Ready event received");
+      case "Ready": {
+        // Log server/channel count from Ready payload for debugging
+        const servers = (data as any).servers ?? [];
+        const channels = (data as any).channels ?? [];
+        console.log(
+          `[stoat-ws] Ready event received — ${servers.length} server(s), ${channels.length} channel(s)`
+        );
         for (const handler of this.handlers.ready) {
           handler(data);
         }
         break;
+      }
 
       case "Pong":
         // Expected response to our Ping
         break;
 
-      case "Message":
+      case "Message": {
+        const msg = data as unknown as BonfireMessageEvent;
+        console.log(
+          `[stoat-ws] Message in ${msg.channel} from ${msg.author}` +
+            (msg.masquerade ? " [masq]" : "") +
+            (msg.content ? ` — "${msg.content.slice(0, 80)}"` : " (no content)")
+        );
         for (const handler of this.handlers.message) {
-          handler(data as unknown as BonfireMessageEvent);
+          handler(msg);
         }
         break;
+      }
 
       case "MessageUpdate":
         for (const handler of this.handlers.messageUpdate) {
@@ -182,7 +195,8 @@ export class StoatWebSocket {
         break;
 
       default:
-        // Ignore other events (ServerUpdate, etc.)
+        // Log unhandled event types for debugging
+        console.log(`[stoat-ws] Unhandled event: ${data.type}`);
         break;
     }
   }
