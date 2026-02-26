@@ -1,5 +1,7 @@
 /** Stoat/Revolt Bonfire WebSocket client for realtime events */
 
+import WS from "ws";
+
 import type {
   BonfireMessageEvent,
   BonfireMessageUpdateEvent,
@@ -33,7 +35,7 @@ interface EventHandlers {
 export class StoatWebSocket {
   private token: string;
   private wsUrl: string;
-  private ws: WebSocket | null = null;
+  private ws: WS | null = null;
   private pingInterval: ReturnType<typeof setInterval> | null = null;
   private livenessInterval: ReturnType<typeof setInterval> | null = null;
   private lastPongAt = 0;
@@ -92,7 +94,7 @@ export class StoatWebSocket {
 
   /** Check if WebSocket is currently connected */
   isConnected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN;
+    return this.ws?.readyState === WS.OPEN;
   }
 
   /** Debug state for diagnostics endpoint */
@@ -106,7 +108,7 @@ export class StoatWebSocket {
     messageCount: number;
   } {
     return {
-      connected: this.ws?.readyState === WebSocket.OPEN,
+      connected: this.ws?.readyState === WS.OPEN,
       readyState: this.ws?.readyState ?? -1,
       pongCount: this.pongCount,
       lastPongAgo: this.lastPongAt > 0 ? Math.round((Date.now() - this.lastPongAt) / 1000) : -1,
@@ -120,58 +122,54 @@ export class StoatWebSocket {
   connect(): void {
     this.shouldReconnect = true;
     const url = `${this.wsUrl}?format=json`;
-    console.log(`[stoat-ws] Connecting to ${url}`);
+    console.log(`[stoat-ws] Connecting to ${url} (using ws library)`);
 
-    this.ws = new WebSocket(url);
+    this.ws = new WS(url);
 
-    this.ws.onopen = () => {
+    this.ws.on("open", () => {
       console.log("[stoat-ws] Connected, authenticating...");
       this.reconnectAttempts = 0;
       // Send authentication
       this.ws?.send(
         JSON.stringify({ type: "Authenticate", token: this.token })
       );
-    };
+    });
 
-    this.ws.onmessage = (event) => {
+    this.ws.on("message", (data: WS.Data) => {
       try {
-        const raw = event.data as string;
-        const data = JSON.parse(raw);
+        const raw = typeof data === "string" ? data : data.toString();
+        const parsed = JSON.parse(raw);
         // Debug: log every raw event type received (including Pong for first 5)
-        if (data.type !== "Pong" || this.pongCount < 5) {
-          console.log(`[stoat-ws] <<< ${data.type} (${raw.length} bytes)${
-            data.type === "Message" ? ` ch=${data.channel} from=${data.author}` : ""
+        if (parsed.type !== "Pong" || this.pongCount < 5) {
+          console.log(`[stoat-ws] <<< ${parsed.type} (${raw.length} bytes)${
+            parsed.type === "Message" ? ` ch=${parsed.channel} from=${parsed.author}` : ""
           }`);
         }
-        this.handleEvent(data);
+        this.handleEvent(parsed);
       } catch (e) {
         console.error("[stoat-ws] Failed to parse message:", e);
       }
-    };
+    });
 
-    // Bun WebSocket may not auto-respond to RFC 6455 ping frames.
-    // Attach a low-level ping handler if available (ws-compatible API).
-    const wsAny = this.ws as any;
-    if (typeof wsAny.on === "function") {
-      wsAny.on("ping", (data: Buffer) => {
-        console.log("[stoat-ws] Received RFC 6455 ping, sending pong");
-        wsAny.pong?.(data);
-      });
-    }
+    // Respond to RFC 6455 ping frames to keep connection alive
+    this.ws.on("ping", (data: Buffer) => {
+      console.log("[stoat-ws] Received RFC 6455 ping, sending pong");
+      this.ws?.pong(data);
+    });
 
-    this.ws.onclose = (event) => {
+    this.ws.on("close", (code: number, reason: Buffer) => {
       console.log(
-        `[stoat-ws] Disconnected (code=${event.code}, reason=${event.reason})`
+        `[stoat-ws] Disconnected (code=${code}, reason=${reason.toString()})`
       );
       this.stopPing();
       if (this.shouldReconnect) {
         this.scheduleReconnect();
       }
-    };
+    });
 
-    this.ws.onerror = (error) => {
-      console.error("[stoat-ws] Error:", error);
-    };
+    this.ws.on("error", (error: Error) => {
+      console.error("[stoat-ws] Error:", error.message);
+    });
   }
 
   /** Gracefully disconnect */
@@ -275,7 +273,7 @@ export class StoatWebSocket {
     this.lastEventAt = Date.now();
 
     this.pingInterval = setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
+      if (this.ws?.readyState === WS.OPEN) {
         this.ws.send(JSON.stringify({ type: "Ping", data: Date.now() }));
       }
     }, 30_000);
