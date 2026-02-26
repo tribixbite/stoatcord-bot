@@ -75,7 +75,8 @@ async function main(): Promise<void> {
   }
 
   // Connect Stoat WebSocket for realtime events
-  const stoatWs = new StoatWebSocket(config.stoatToken, config.stoatWsUrl);
+  const stoatWs = new StoatWebSocket(config.stoatToken, config.stoatWsUrl, config.stoatApiBase);
+  stoatWs.setBotUserId(botSelfId);
   // discordClient is set later; use a mutable reference for the recovery closure
   let discordClientRef: ReturnType<typeof createDiscordClient> | null = null;
   stoatWs.on("ready", () => {

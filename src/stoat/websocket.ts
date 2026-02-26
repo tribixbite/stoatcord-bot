@@ -35,16 +35,27 @@ interface EventHandlers {
 export class StoatWebSocket {
   private token: string;
   private wsUrl: string;
+  private apiBase: string;
   private ws: WS | null = null;
   private pingInterval: ReturnType<typeof setInterval> | null = null;
   private livenessInterval: ReturnType<typeof setInterval> | null = null;
+  private pollInterval: ReturnType<typeof setInterval> | null = null;
   private lastPongAt = 0;
   private lastEventAt = 0;
   private pongCount = 0;
   private messageCount = 0;
+  private pollMessageCount = 0;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private shouldReconnect = true;
+  /** Channel IDs from Ready payload — used for REST polling fallback */
+  private channelIds: string[] = [];
+  /** Track last seen message ID per channel to avoid reprocessing */
+  private lastSeenMessageId = new Map<string, string>();
+  /** Set of message IDs already processed (via WS or poll) to prevent duplicates */
+  private processedMessages = new Set<string>();
+  /** Bot's own user ID (from Ready payload or auth) */
+  private botUserId = "";
   private handlers: EventHandlers = {
     message: [],
     messageUpdate: [],
@@ -56,9 +67,15 @@ export class StoatWebSocket {
     ready: [],
   };
 
-  constructor(token: string, wsUrl: string) {
+  constructor(token: string, wsUrl: string, apiBase?: string) {
     this.token = token;
     this.wsUrl = wsUrl;
+    this.apiBase = apiBase || "https://stoat.chat/api";
+  }
+
+  /** Set the bot's user ID (called from index.ts after API auth) */
+  setBotUserId(id: string): void {
+    this.botUserId = id;
   }
 
   /** Register event handler */
@@ -98,15 +115,7 @@ export class StoatWebSocket {
   }
 
   /** Debug state for diagnostics endpoint */
-  getDebugState(): {
-    connected: boolean;
-    readyState: number;
-    pongCount: number;
-    lastPongAgo: number;
-    lastEventAgo: number;
-    reconnectAttempts: number;
-    messageCount: number;
-  } {
+  getDebugState(): Record<string, unknown> {
     return {
       connected: this.ws?.readyState === WS.OPEN,
       readyState: this.ws?.readyState ?? -1,
@@ -115,6 +124,8 @@ export class StoatWebSocket {
       lastEventAgo: this.lastEventAt > 0 ? Math.round((Date.now() - this.lastEventAt) / 1000) : -1,
       reconnectAttempts: this.reconnectAttempts,
       messageCount: this.messageCount,
+      pollMessageCount: this.pollMessageCount,
+      polledChannels: this.channelIds.length,
     };
   }
 
@@ -176,6 +187,7 @@ export class StoatWebSocket {
   disconnect(): void {
     this.shouldReconnect = false;
     this.stopPing();
+    this.stopPolling();
     this.ws?.close(1000, "Shutting down");
     this.ws = null;
   }
@@ -200,9 +212,15 @@ export class StoatWebSocket {
           `[stoat-ws] Ready — ${channels.length} channel(s) subscribed`
         );
 
-        // Log channel IDs for debugging WS subscription coverage
-        const channelIds = channels.map((c: any) => c._id || c);
-        console.log(`[stoat-ws] Channel IDs in Ready: ${channelIds.join(", ")}`);
+        // Capture channel IDs for REST polling fallback and extract bot user ID
+        this.channelIds = channels.map((c: any) => c._id || c);
+        const users = (data as any).users ?? [];
+        for (const u of users) {
+          if (u.bot) {
+            this.botUserId = u._id;
+            break;
+          }
+        }
 
         // Subscribe to each server (required by Bonfire protocol for channel events)
         for (const server of servers) {
@@ -210,6 +228,9 @@ export class StoatWebSocket {
           this.ws?.send(subMsg);
           console.log(`[stoat-ws] Subscribed to server: ${server.name} (${server._id})`);
         }
+
+        // Start REST polling fallback for message detection
+        this.startPolling();
 
         this.safeDispatch("ready", this.handlers.ready, data);
         break;
@@ -224,13 +245,18 @@ export class StoatWebSocket {
         break;
 
       case "Message": {
-        this.messageCount++;
         const msg = data as unknown as BonfireMessageEvent;
+        // Deduplicate: skip if already processed by WS or REST poll
+        if (this.processedMessages.has(msg._id)) break;
+        this.processedMessages.add(msg._id);
+        this.messageCount++;
         console.log(
           `[stoat-ws] Message #${this.messageCount} in ${msg.channel} from ${msg.author}` +
             (msg.masquerade ? " [masq]" : "") +
             (msg.content ? ` — "${msg.content.slice(0, 80)}"` : " (no content)")
         );
+        // Update last seen for polling
+        this.lastSeenMessageId.set(msg.channel, msg._id);
         this.safeDispatch("message", this.handlers.message, msg);
         break;
       }
@@ -307,6 +333,105 @@ export class StoatWebSocket {
     if (this.livenessInterval) {
       clearInterval(this.livenessInterval);
       this.livenessInterval = null;
+    }
+  }
+
+  /**
+   * REST API polling fallback — periodically checks channels for new messages.
+   * Works around a Stoat Bonfire issue where bot WebSocket connections don't
+   * receive Message events from other users in server channels.
+   */
+  private startPolling(): void {
+    this.stopPolling();
+    // Poll every 5 seconds — balances responsiveness vs API load
+    const POLL_INTERVAL = 5_000;
+    // Rotate through channels: poll a batch each cycle to spread API load
+    const CHANNELS_PER_CYCLE = 10;
+    let offset = 0;
+
+    console.log(`[stoat-ws:poll] Starting REST poll fallback for ${this.channelIds.length} channels (every ${POLL_INTERVAL / 1000}s)`);
+
+    this.pollInterval = setInterval(async () => {
+      if (!this.channelIds.length) return;
+      const batch: string[] = [];
+      for (let i = 0; i < CHANNELS_PER_CYCLE && i < this.channelIds.length; i++) {
+        const ch = this.channelIds[(offset + i) % this.channelIds.length];
+        if (ch) batch.push(ch);
+      }
+      offset = (offset + CHANNELS_PER_CYCLE) % this.channelIds.length;
+
+      for (const channelId of batch) {
+        try {
+          await this.pollChannel(channelId);
+        } catch (err) {
+          // Silently ignore poll errors — non-critical fallback
+        }
+      }
+    }, POLL_INTERVAL);
+  }
+
+  private stopPolling(): void {
+    if (this.pollInterval) {
+      clearInterval(this.pollInterval);
+      this.pollInterval = null;
+    }
+  }
+
+  /** Poll a single channel for new messages via REST API */
+  private async pollChannel(channelId: string): Promise<void> {
+    const lastId = this.lastSeenMessageId.get(channelId);
+    const url = lastId
+      ? `${this.apiBase}/channels/${channelId}/messages?limit=10&after=${lastId}&sort=Latest`
+      : `${this.apiBase}/channels/${channelId}/messages?limit=1&sort=Latest`;
+
+    const resp = await fetch(url, {
+      headers: { "x-bot-token": this.token },
+    });
+    if (!resp.ok) return;
+
+    const messages = (await resp.json()) as any[];
+    if (!messages.length) return;
+
+    // Process messages in chronological order (API returns newest first)
+    const sorted = messages.reverse();
+
+    for (const msg of sorted) {
+      // Skip if already processed
+      if (this.processedMessages.has(msg._id)) continue;
+      // Skip bot's own messages
+      if (msg.author === this.botUserId) {
+        this.lastSeenMessageId.set(channelId, msg._id);
+        continue;
+      }
+      this.processedMessages.add(msg._id);
+      this.pollMessageCount++;
+      this.lastSeenMessageId.set(channelId, msg._id);
+
+      console.log(
+        `[stoat-ws:poll] Message from ${msg.author} in ${channelId}` +
+          (msg.content ? ` — "${msg.content.slice(0, 80)}"` : " (no content)")
+      );
+
+      // Dispatch as if it came via WebSocket
+      const event: BonfireMessageEvent = {
+        type: "Message",
+        _id: msg._id,
+        channel: msg.channel || channelId,
+        author: msg.author,
+        content: msg.content,
+        attachments: msg.attachments,
+        embeds: msg.embeds,
+        replies: msg.replies,
+        masquerade: msg.masquerade,
+      };
+      this.messageCount++;
+      this.safeDispatch("message", this.handlers.message, event);
+    }
+
+    // Prevent processedMessages set from growing unbounded
+    if (this.processedMessages.size > 10000) {
+      const entries = [...this.processedMessages];
+      this.processedMessages = new Set(entries.slice(-5000));
     }
   }
 
