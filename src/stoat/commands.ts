@@ -116,29 +116,52 @@ export function setupStoatCommands(
 
     // --- Parse bot commands ---
     const parsed = parseCommand(event.content, botUserId);
+
+    // Resolve server context (null for DM channels)
+    const serverId = await getServerForChannel(stoatClient, event.channel);
+    const isDM = !serverId;
+
+    // In DMs, respond to any message (even without command prefix) with help
+    if (isDM && !parsed) {
+      await handleHelpCommand(event, stoatClient);
+      return;
+    }
+
     if (!parsed) return;
 
-    const serverId = await getServerForChannel(stoatClient, event.channel);
-    if (!serverId) return;
+    // Commands that work in both DMs and server channels
+    const dmSafeCommands = ["help", "ping", "push"];
+
+    if (isDM && !dmSafeCommands.includes(parsed.command)) {
+      // Server-dependent command used in DM — send help instead
+      await stoatClient.sendMessage(
+        event.channel,
+        `\`${parsed.command}\` only works in server channels.\n\n` +
+        `Commands available in DMs: \`help\`, \`ping\`, \`push\`\n\n` +
+        `Type \`!stoatcord help\` for the full command list.`,
+        { replies: [{ id: event._id, mention: false }] }
+      );
+      return;
+    }
 
     switch (parsed.command) {
       case "code":
-        await handleCodeCommand(event, serverId, stoatClient, store);
+        await handleCodeCommand(event, serverId!, stoatClient, store);
         break;
       case "request":
-        await handleRequestCommand(event, serverId, parsed.args, stoatClient, store, discordClient);
+        await handleRequestCommand(event, serverId!, parsed.args, stoatClient, store, discordClient);
         break;
       case "status":
-        await handleStatusCommand(event, serverId, stoatClient, store);
+        await handleStatusCommand(event, serverId!, stoatClient, store);
         break;
       case "ping":
         await handlePingCommand(event, parsed.args, stoatClient);
         break;
       case "diag":
-        await handleDiagCommand(event, serverId, stoatClient);
+        await handleDiagCommand(event, serverId!, stoatClient);
         break;
       case "archive":
-        await handleArchiveCommand(event, serverId, stoatClient, store);
+        await handleArchiveCommand(event, serverId!, stoatClient, store);
         break;
       case "push":
         await handlePushCommand(event, parsed.args, stoatClient, store, pushStore);
@@ -147,11 +170,16 @@ export function setupStoatCommands(
         await handleHelpCommand(event, stoatClient);
         break;
       default:
-        await stoatClient.sendMessage(
-          event.channel,
-          `Unknown command \`${parsed.command}\`. Type \`!stoatcord help\` for available commands.`,
-          { replies: [{ id: event._id, mention: false }] }
-        );
+        if (isDM) {
+          // DM with unknown command — show full help
+          await handleHelpCommand(event, stoatClient);
+        } else {
+          await stoatClient.sendMessage(
+            event.channel,
+            `Unknown command \`${parsed.command}\`. Type \`!stoatcord help\` for available commands.`,
+            { replies: [{ id: event._id, mention: false }] }
+          );
+        }
     }
   });
 
