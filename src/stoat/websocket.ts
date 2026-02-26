@@ -200,11 +200,12 @@ export class StoatWebSocket {
           `[stoat-ws] Ready — ${channels.length} channel(s) subscribed`
         );
 
-        // Subscribe to each server for full event delivery (Bonfire protocol)
+        // NOTE: Do NOT send Subscribe messages — Bonfire auto-subscribes to all
+        // servers/channels after Ready. Sending Subscribe may interfere with
+        // default event delivery (observed: bot receives own messages but not
+        // other users' messages when Subscribe is sent).
         for (const server of servers) {
-          const subMsg = JSON.stringify({ type: "Subscribe", server_id: server._id });
-          this.ws?.send(subMsg);
-          console.log(`[stoat-ws] Subscribed to server: ${server.name} (${server._id})`);
+          console.log(`[stoat-ws] Server available: ${server.name} (${server._id})`);
         }
 
         this.safeDispatch("ready", this.handlers.ready, data);
