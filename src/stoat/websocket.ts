@@ -137,9 +137,11 @@ export class StoatWebSocket {
       try {
         const raw = event.data as string;
         const data = JSON.parse(raw);
-        // Debug: log every raw event type received
-        if (data.type !== "Pong") {
-          console.log(`[stoat-ws] <<< ${data.type} (${raw.length} bytes)`);
+        // Debug: log every raw event type received (including Pong for first 5)
+        if (data.type !== "Pong" || this.pongCount < 5) {
+          console.log(`[stoat-ws] <<< ${data.type} (${raw.length} bytes)${
+            data.type === "Message" ? ` ch=${data.channel} from=${data.author}` : ""
+          }`);
         }
         this.handleEvent(data);
       } catch (e) {
@@ -200,12 +202,15 @@ export class StoatWebSocket {
           `[stoat-ws] Ready — ${channels.length} channel(s) subscribed`
         );
 
-        // NOTE: Do NOT send Subscribe messages — Bonfire auto-subscribes to all
-        // servers/channels after Ready. Sending Subscribe may interfere with
-        // default event delivery (observed: bot receives own messages but not
-        // other users' messages when Subscribe is sent).
+        // Log channel IDs for debugging WS subscription coverage
+        const channelIds = channels.map((c: any) => c._id || c);
+        console.log(`[stoat-ws] Channel IDs in Ready: ${channelIds.join(", ")}`);
+
+        // Subscribe to each server (required by Bonfire protocol for channel events)
         for (const server of servers) {
-          console.log(`[stoat-ws] Server available: ${server.name} (${server._id})`);
+          const subMsg = JSON.stringify({ type: "Subscribe", server_id: server._id });
+          this.ws?.send(subMsg);
+          console.log(`[stoat-ws] Subscribed to server: ${server.name} (${server._id})`);
         }
 
         this.safeDispatch("ready", this.handlers.ready, data);
