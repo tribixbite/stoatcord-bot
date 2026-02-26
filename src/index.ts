@@ -1,5 +1,13 @@
 /** stoatcord-bot — Discord↔Stoat migration & message bridge bot */
 
+// Global error handlers — prevent unhandled errors from crashing the bot
+process.on("uncaughtException", (err) => {
+  console.error("[bot] UNCAUGHT EXCEPTION — bot will continue running:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[bot] UNHANDLED REJECTION — bot will continue running:", reason);
+});
+
 // Load .env first — grun doesn't pass env vars to child processes
 import "./env.ts";
 

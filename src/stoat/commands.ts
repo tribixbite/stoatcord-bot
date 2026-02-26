@@ -102,6 +102,7 @@ export function setupStoatCommands(
   pushStore?: PushStore
 ): void {
   stoatWs.on("message", async (event: BonfireMessageEvent) => {
+    try {
     // Skip messages from the bot itself
     if (event.author === botUserId) return;
     // Skip masqueraded messages (bridged from Discord)
@@ -180,6 +181,17 @@ export function setupStoatCommands(
             { replies: [{ id: event._id, mention: false }] }
           );
         }
+    }
+    } catch (err) {
+      console.error(`[stoat-cmd] Unhandled error processing message ${event._id} in ${event.channel}:`, err);
+      // Attempt to notify the user that something went wrong
+      try {
+        await stoatClient.sendMessage(
+          event.channel,
+          `An internal error occurred. Please try again.`,
+          { replies: [{ id: event._id, mention: false }] }
+        );
+      } catch { /* ignore send failure */ }
     }
   });
 

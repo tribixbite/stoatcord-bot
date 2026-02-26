@@ -72,6 +72,24 @@ export class StoatWebSocket {
     (this.handlers[event] as ((...args: any[]) => void)[]).push(handler);
   }
 
+  /** Safely invoke all handlers for an event, catching sync and async errors */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private safeDispatch<T>(eventName: string, handlers: ((arg: T) => any)[], arg: T): void {
+    for (const handler of handlers) {
+      try {
+        const result = handler(arg);
+        // Catch async handler rejections (handlers may return Promise)
+        if (result && typeof result.catch === "function") {
+          result.catch((err: unknown) =>
+            console.error(`[stoat-ws] Async error in ${eventName} handler:`, err)
+          );
+        }
+      } catch (err) {
+        console.error(`[stoat-ws] Error in ${eventName} handler:`, err);
+      }
+    }
+  }
+
   /** Check if WebSocket is currently connected */
   isConnected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
@@ -189,16 +207,13 @@ export class StoatWebSocket {
           console.log(`[stoat-ws] Subscribed to server: ${server.name} (${server._id})`);
         }
 
-        for (const handler of this.handlers.ready) {
-          handler(data);
-        }
+        this.safeDispatch("ready", this.handlers.ready, data);
         break;
       }
 
       case "Pong":
         this.lastPongAt = Date.now();
         this.pongCount = (this.pongCount ?? 0) + 1;
-        // Log every 10th pong (~5 min) to confirm connection is alive
         if (this.pongCount % 10 === 0) {
           console.log(`[stoat-ws] Pong #${this.pongCount} — connection alive`);
         }
@@ -212,46 +227,32 @@ export class StoatWebSocket {
             (msg.masquerade ? " [masq]" : "") +
             (msg.content ? ` — "${msg.content.slice(0, 80)}"` : " (no content)")
         );
-        for (const handler of this.handlers.message) {
-          handler(msg);
-        }
+        this.safeDispatch("message", this.handlers.message, msg);
         break;
       }
 
       case "MessageUpdate":
-        for (const handler of this.handlers.messageUpdate) {
-          handler(data as unknown as BonfireMessageUpdateEvent);
-        }
+        this.safeDispatch("messageUpdate", this.handlers.messageUpdate, data as unknown as BonfireMessageUpdateEvent);
         break;
 
       case "MessageDelete":
-        for (const handler of this.handlers.messageDelete) {
-          handler(data as unknown as BonfireMessageDeleteEvent);
-        }
+        this.safeDispatch("messageDelete", this.handlers.messageDelete, data as unknown as BonfireMessageDeleteEvent);
         break;
 
       case "MessageReact":
-        for (const handler of this.handlers.messageReact) {
-          handler(data as unknown as BonfireMessageReactEvent);
-        }
+        this.safeDispatch("messageReact", this.handlers.messageReact, data as unknown as BonfireMessageReactEvent);
         break;
 
       case "MessageUnreact":
-        for (const handler of this.handlers.messageUnreact) {
-          handler(data as unknown as BonfireMessageUnreactEvent);
-        }
+        this.safeDispatch("messageUnreact", this.handlers.messageUnreact, data as unknown as BonfireMessageUnreactEvent);
         break;
 
       case "ChannelStartTyping":
-        for (const handler of this.handlers.channelStartTyping) {
-          handler(data as unknown as BonfireChannelStartTypingEvent);
-        }
+        this.safeDispatch("channelStartTyping", this.handlers.channelStartTyping, data as unknown as BonfireChannelStartTypingEvent);
         break;
 
       case "ChannelUpdate":
-        for (const handler of this.handlers.channelUpdate) {
-          handler(data as unknown as BonfireChannelUpdateEvent);
-        }
+        this.safeDispatch("channelUpdate", this.handlers.channelUpdate, data as unknown as BonfireChannelUpdateEvent);
         break;
 
       default:
