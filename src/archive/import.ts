@@ -26,6 +26,12 @@ export interface ImportOptions {
   reconstructReplies?: boolean;
   /** Convert Discord embeds to Stoat embed format */
   preserveEmbeds?: boolean;
+  /**
+   * Job whose exported rows should be replayed. Defaults to the newest export
+   * job for this channel: an import runs under its own job id, but the rows
+   * live under the export job that produced them.
+   */
+  sourceJobId?: string;
 }
 
 export interface ImportProgress {
@@ -66,7 +72,12 @@ export async function importToStoat(
 
   store.updateArchiveJobStatus(jobId, "running");
 
-  const counts = store.getArchiveMessageCounts(jobId);
+  const sourceJobId =
+    options.sourceJobId ??
+    store.getLatestExportJobId(job.guild_id, job.discord_channel_id) ??
+    jobId;
+
+  const counts = store.getArchiveMessageCounts(sourceJobId);
   let importedCount = counts.imported;
   let rehostSuccesses = 0;
   let rehostFailures = 0;
@@ -90,7 +101,7 @@ export async function importToStoat(
   try {
     let batch: ArchiveMessageRow[];
 
-    while ((batch = store.getUnimportedMessages(jobId, IMPORT_BATCH_SIZE)).length > 0) {
+    while ((batch = store.getUnimportedMessages(sourceJobId, IMPORT_BATCH_SIZE)).length > 0) {
       for (const msg of batch) {
         if (signal?.aborted) {
           store.updateArchiveJobStatus(jobId, "paused", {
@@ -102,7 +113,7 @@ export async function importToStoat(
 
         try {
           const result = await sendArchivedMessage(
-            stoatClient, store, stoatChannelId, msg, jobId,
+            stoatClient, store, stoatChannelId, msg, sourceJobId,
             { rehostAttachments, reconstructReplies, preserveEmbeds }
           );
           if (result.stoatMsgId) {

@@ -616,6 +616,7 @@ async function handleArchiveStart(
         }
 
         await importToStoat(stoatClient, store, importJobId, stoatChannelId, importSignal, undefined, {
+          sourceJobId: jobId,
           rehostAttachments,
           reconstructReplies: true,
           preserveEmbeds,
