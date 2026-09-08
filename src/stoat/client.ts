@@ -24,6 +24,15 @@ import type {
   AutumnUploadResponse,
 } from "./types.ts";
 
+/**
+ * Revolt takes permission overrides as `Override { allow, deny }` on the way in,
+ * but stores and returns them as `OverrideField { a, d }`. Sending the stored
+ * shape back is a 422, so serialize at the boundary.
+ */
+function toOverride(perms: PermissionsPair): { allow: number; deny: number } {
+  return { allow: perms.a, deny: perms.d };
+}
+
 interface RateLimitState {
   remaining: number;
   resetAt: number; // ms timestamp
@@ -227,7 +236,7 @@ export class StoatClient {
     await this.request<unknown>(
       "PUT",
       `/servers/${serverId}/permissions/${roleId}`,
-      { permissions: perms }
+      { permissions: toOverride(perms) }
     );
   }
 
@@ -330,7 +339,7 @@ export class StoatClient {
     await this.request<unknown>(
       "PUT",
       `/channels/${channelId}/permissions/${roleId}`,
-      { permissions: perms }
+      { permissions: toOverride(perms) }
     );
   }
 
@@ -345,7 +354,7 @@ export class StoatClient {
     await this.request<unknown>(
       "PUT",
       `/channels/${channelId}/permissions/default`,
-      { permissions: perms }
+      { permissions: toOverride(perms) }
     );
   }
 
