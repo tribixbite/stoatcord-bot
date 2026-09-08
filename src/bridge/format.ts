@@ -69,9 +69,69 @@ export function formatBridgedName(
 /**
  * Truncate content to Revolt's max message length (2000 chars).
  */
-export function truncateForRevolt(content: string): string {
-  if (content.length <= 2000) return content;
-  return content.slice(0, 1997) + "...";
+export const REVOLT_MAX_MESSAGE_BYTES = 2000;
+
+const encoder = new TextEncoder();
+
+/** UTF-8 byte length — what Revolt actually measures a message against. */
+export function byteLength(text: string): number {
+  return encoder.encode(text).length;
+}
+
+/** Longest prefix of `text` fitting in `maxBytes`, never cutting mid-character. */
+function sliceByBytes(text: string, maxBytes: number): string {
+  let out = "";
+  let used = 0;
+  for (const ch of text) {
+    const n = byteLength(ch);
+    if (used + n > maxBytes) break;
+    out += ch;
+    used += n;
+  }
+  return out;
+}
+
+/**
+ * Truncate to Revolt's message limit, which is 2000 UTF-8 BYTES rather than
+ * 2000 characters — verified against the live API, where 667 characters
+ * totalling 2001 bytes is rejected with 422 PayloadTooLarge.
+ */
+export function truncateForRevolt(
+  content: string,
+  maxBytes: number = REVOLT_MAX_MESSAGE_BYTES
+): string {
+  if (byteLength(content) <= maxBytes) return content;
+  return sliceByBytes(content, maxBytes - 3) + "...";
+}
+
+/**
+ * Split content into chunks that each fit Revolt's byte limit, breaking at a
+ * paragraph, line or word boundary where one is available. Used by the archive
+ * importer so long messages are preserved in full instead of truncated.
+ */
+export function splitForRevolt(
+  content: string,
+  maxBytes: number = REVOLT_MAX_MESSAGE_BYTES
+): string[] {
+  if (!content) return [];
+  if (byteLength(content) <= maxBytes) return [content];
+
+  const chunks: string[] = [];
+  let rest = content;
+  while (byteLength(rest) > maxBytes) {
+    let head = sliceByBytes(rest, maxBytes);
+    const boundary = Math.max(
+      head.lastIndexOf("\n\n"),
+      head.lastIndexOf("\n"),
+      head.lastIndexOf(" ")
+    );
+    // Only honour a boundary that isn't throwing away most of the chunk.
+    if (boundary > head.length / 2) head = head.slice(0, boundary);
+    chunks.push(head.trimEnd());
+    rest = rest.slice(head.length).replace(/^\s+/, "");
+  }
+  if (rest) chunks.push(rest);
+  return chunks;
 }
 
 /**

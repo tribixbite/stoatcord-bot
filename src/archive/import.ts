@@ -9,7 +9,7 @@ import type { StoatClient } from "../stoat/client.ts";
 import type { Store } from "../db/store.ts";
 import type { ArchiveMessageRow } from "../db/schema.ts";
 import type { Embed, SendMessageRequest } from "../stoat/types.ts";
-import { discordToRevolt, truncateForRevolt } from "../bridge/format.ts";
+import { discordToRevolt, splitForRevolt } from "../bridge/format.ts";
 import { sleep } from "../util.ts";
 
 /** Stoat rate limit: 10 messages per 10 seconds per channel */
@@ -224,7 +224,6 @@ async function sendArchivedMessage(
 
   // Prepend timestamp header
   content = `*${timestampStr}*\n${content}`.trim();
-  content = truncateForRevolt(content);
 
   if (!content && autumnIds.length === 0) return result;
 
@@ -250,7 +249,6 @@ async function sendArchivedMessage(
     } else {
       // Parent not yet imported or not in this job — add quote fallback
       content = `> *Replying to an earlier message*\n${content}`;
-      content = truncateForRevolt(content);
     }
   }
 
@@ -287,8 +285,32 @@ async function sendArchivedMessage(
     }
   }
 
-  const sent = await stoatClient.sendMessage(channelId, content || " ", sendOpts);
-  result.stoatMsgId = sent._id ?? null;
+  // Revolt caps content at 2000 UTF-8 bytes. Split rather than truncate so no
+  // archived text is lost; replies anchor to the first part, attachments and
+  // embeds ride on the last.
+  const chunks = splitForRevolt(content);
+  if (chunks.length === 0) chunks.push(" ");
+
+  for (let i = 0; i < chunks.length; i++) {
+    const isFirst = i === 0;
+    const isLast = i === chunks.length - 1;
+
+    const chunkOpts: Partial<Omit<SendMessageRequest, "content">> = {
+      masquerade: sendOpts.masquerade,
+    };
+    if (isFirst && sendOpts.replies) chunkOpts.replies = sendOpts.replies;
+    if (isLast && sendOpts.attachments) chunkOpts.attachments = sendOpts.attachments;
+    if (isLast && sendOpts.embeds) chunkOpts.embeds = sendOpts.embeds;
+
+    const sent = await stoatClient.sendMessage(
+      channelId,
+      chunks[i] || " ",
+      chunkOpts
+    );
+    if (isFirst) result.stoatMsgId = sent._id ?? null;
+    if (!isLast) await sleep(SEND_DELAY_MS);
+  }
+
   return result;
 }
 
