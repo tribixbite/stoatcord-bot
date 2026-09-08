@@ -79,6 +79,20 @@ function checkAbort(signal?: AbortSignal): void {
  * Handles three cases per item: create new, update existing (by name match), or skip.
  * Reports progress via callback for Discord embed updates.
  */
+/**
+ * Revolt emoji names must match /^[a-z0-9_]+$/ and be 1-32 characters.
+ * Verified against the live API: an uppercase name fails the `name` regex
+ * and a 33-character name fails the length rule, both with 400 FailedValidation.
+ */
+function sanitizeEmojiName(name: string): string {
+  const cleaned = name
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, "_")
+    .slice(0, 32)
+    .replace(/^_+|_+$/g, "");
+  return cleaned || "emoji";
+}
+
 export async function executeMigration(
   stoatClient: StoatClient,
   store: Store,
@@ -558,15 +572,23 @@ async function migrateEmoji(
   for (const [, emoji] of guild.emojis.cache) {
     checkAbort(signal);
 
-    // Resolve name conflicts
-    let resolvedName = emoji.name ?? "emoji";
-    if (existingEmojiNames.has(resolvedName.toLowerCase())) {
+    const discordName = emoji.name ?? "emoji";
+    let resolvedName = sanitizeEmojiName(discordName);
+    if (resolvedName !== discordName) {
+      progress.warnings.push(
+        `Emoji renamed for Stoat's naming rules: '${discordName}' → '${resolvedName}'`
+      );
+    }
+
+    // Resolve name conflicts, leaving room for the numeric suffix
+    if (existingEmojiNames.has(resolvedName)) {
+      const base = resolvedName.slice(0, 30);
       let suffix = 0;
-      while (existingEmojiNames.has(`${resolvedName}${suffix}`.toLowerCase())) {
+      while (existingEmojiNames.has(`${base}${suffix}`)) {
         suffix++;
       }
       const originalName = resolvedName;
-      resolvedName = `${resolvedName}${suffix}`;
+      resolvedName = `${base}${suffix}`;
       progress.warnings.push(`Emoji renamed: '${originalName}' → '${resolvedName}'`);
     }
 
