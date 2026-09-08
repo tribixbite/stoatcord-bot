@@ -24,6 +24,9 @@ import type {
   AutumnUploadResponse,
 } from "./types.ts";
 
+/** Upper bound on any rate-limit sleep, so a bad header can't stall for hours */
+const MAX_RATE_LIMIT_WAIT_MS = 60_000;
+
 interface RateLimitState {
   remaining: number;
   resetAt: number; // ms timestamp
@@ -382,7 +385,9 @@ export class StoatClient {
 
     if (res.status === 429) {
       const retryAfter = res.headers.get("retry-after");
-      const wait = retryAfter ? parseInt(retryAfter, 10) * 1000 : 5000;
+      const wait = retryAfter
+        ? Math.min(parseInt(retryAfter, 10) * 1000, MAX_RATE_LIMIT_WAIT_MS)
+        : 5000;
       console.warn(`[stoat] Rate limited on ${path}, waiting ${wait}ms`);
       await sleep(wait);
       return this.request<T>(method, path, body);
@@ -428,8 +433,11 @@ export class StoatClient {
     if (remaining !== null) {
       this.rateLimits.set(bucket, {
         remaining: parseInt(remaining, 10),
+        // Revolt/Stoat sends x-ratelimit-reset-after in MILLISECONDS
+        // (unlike Discord, which uses seconds). Clamped so a malformed
+        // header can never stall a migration for hours.
         resetAt: reset
-          ? Date.now() + parseInt(reset, 10) * 1000
+          ? Date.now() + Math.min(parseInt(reset, 10), MAX_RATE_LIMIT_WAIT_MS)
           : Date.now() + 10000,
         bucket,
       });
