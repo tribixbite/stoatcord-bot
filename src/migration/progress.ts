@@ -79,6 +79,20 @@ function checkAbort(signal?: AbortSignal): void {
  * Handles three cases per item: create new, update existing (by name match), or skip.
  * Reports progress via callback for Discord embed updates.
  */
+/**
+ * Revolt emoji names must match /^[a-z0-9_]+$/ and be 1-32 characters.
+ * Verified against the live API: an uppercase name fails the `name` regex
+ * and a 33-character name fails the length rule, both with 400 FailedValidation.
+ */
+function sanitizeEmojiName(name: string): string {
+  const cleaned = name
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, "_")
+    .slice(0, 32)
+    .replace(/^_+|_+$/g, "");
+  return cleaned || "emoji";
+}
+
 export async function executeMigration(
   stoatClient: StoatClient,
   store: Store,
@@ -528,7 +542,9 @@ export async function executeMigration(
 /**
  * Migrate Discord guild emoji to Stoat server.
  * Downloads from Discord CDN, uploads to Autumn, creates emoji in Stoat.
- * Resolves name conflicts by appending incrementing suffix (name0, name1, ...).
+ * An emoji whose sanitized name already exists on Stoat was migrated by an
+ * earlier run and is skipped. Suffixes are only for two Discord emoji that
+ * collide with each other within a single run (e.g. 'anomaly' and 'Anomaly').
  */
 async function migrateEmoji(
   stoatClient: StoatClient,
@@ -555,20 +571,43 @@ async function migrateEmoji(
     progress.warnings.push("Could not fetch existing Stoat emoji for dedup — proceeding without");
   }
 
+  // Names claimed during this run, used to tell a genuine collision between two
+  // Discord emoji apart from an emoji a previous run already migrated.
+  const claimedThisRun = new Set<string>();
+
   for (const [, emoji] of guild.emojis.cache) {
     checkAbort(signal);
 
-    // Resolve name conflicts
-    let resolvedName = emoji.name ?? "emoji";
-    if (existingEmojiNames.has(resolvedName.toLowerCase())) {
+    const discordName = emoji.name ?? "emoji";
+    let resolvedName = sanitizeEmojiName(discordName);
+    if (resolvedName !== discordName) {
+      progress.warnings.push(
+        `Emoji renamed for Stoat's naming rules: '${discordName}' → '${resolvedName}'`
+      );
+    }
+
+    // Already on Stoat from an earlier run — skip rather than upload a copy.
+    if (existingEmojiNames.has(resolvedName) && !claimedThisRun.has(resolvedName)) {
+      claimedThisRun.add(resolvedName);
+      progress.skipped++;
+      progress.completedSteps++;
+      if (onProgress) await onProgress(progress);
+      continue;
+    }
+
+    // Two Discord emoji collided within this run — suffix the later one,
+    // leaving room for the digits.
+    if (claimedThisRun.has(resolvedName)) {
+      const base = resolvedName.slice(0, 30);
       let suffix = 0;
-      while (existingEmojiNames.has(`${resolvedName}${suffix}`.toLowerCase())) {
+      while (claimedThisRun.has(`${base}${suffix}`) || existingEmojiNames.has(`${base}${suffix}`)) {
         suffix++;
       }
       const originalName = resolvedName;
-      resolvedName = `${resolvedName}${suffix}`;
+      resolvedName = `${base}${suffix}`;
       progress.warnings.push(`Emoji renamed: '${originalName}' → '${resolvedName}'`);
     }
+    claimedThisRun.add(resolvedName);
 
     progress.currentAction = dryRun
       ? `[DRY RUN] Would migrate emoji: ${resolvedName}`
