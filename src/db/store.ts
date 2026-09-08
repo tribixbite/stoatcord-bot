@@ -750,6 +750,18 @@ export class Store {
   }
 
   /** Count total and imported messages for a job */
+  /** Newest export job for a channel — the source of rows an import job replays */
+  getLatestExportJobId(guildId: string, discordChannelId: string): string | null {
+    const row = this.db
+      .query<{ id: string }, [string, string]>(
+        `SELECT id FROM archive_jobs
+         WHERE guild_id = ? AND discord_channel_id = ? AND direction = 'export'
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(guildId, discordChannelId);
+    return row?.id ?? null;
+  }
+
   getArchiveMessageCounts(jobId: string): { total: number; imported: number } {
     const total = this.db
       .query<{ count: number }, [string]>(
